@@ -1,0 +1,84 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+pytest-cache-files-*/
+.coverage
+coverage.xml
+htmlcov/
+
+# Models (large binary files — store separately)
+backend/models/**/*.pt
+backend/models/**/*.engine
+backend/models/**/*.onnx
+backend/models/**/*.pth
+backend/models/**/*.safetensors
+backend/models/**/*.bin
+backend/models/**/*.blob
+backend/models/**/.cache/
+!backend/models/.gitkeep
+!backend/models/**/.gitkeep
+!backend/models/manifest.json
+!backend/models/manifest.lock.json
+
+# Storage
+backend/storage/
+storage/
+training/data/
+uploads/
+runs/
+checkpoints/
+artifacts/
+*.jpg
+*.jpeg
+*.png
+!docs/**/*.png
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+*.zip
+*.7z
+*.tar
+*.tar.gz
+*.tgz
+
+# Environment
+.env
+.env.local
+.env.production
+.env.*
+!.env.example
+
+# Node
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+
+# Docker
+*.log
+*.pid
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# DB
+*.db
+*.sqlite
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Accidental shell brace-expansion directories
+/[{]backend/
+/frontend/src/app/training/[{]datasets,annotate,jobs,models,registry[}]/

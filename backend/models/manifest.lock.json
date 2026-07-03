@@ -1,0 +1,166 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-07-02T01:58:31.966417+00:00",
+  "artifacts": [
+    {
+      "id": "yolo11n-coco",
+      "role": "vehicle_detector",
+      "format": "pytorch",
+      "path": "vehicle_detector/yolo11n.pt",
+      "url": "https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n.pt",
+      "source_revision": "ultralytics-assets-v8.3.0",
+      "license": "AGPL-3.0-or-Ultralytics-Enterprise",
+      "classes": [
+        "car",
+        "motorcycle",
+        "bus",
+        "truck"
+      ],
+      "sha256": "0ebbc80d4a7680d14987a577cd21342b65ecfd94632bd9a8da63ae6417644ee1",
+      "size_bytes": 5613764,
+      "verified_at": "2026-07-02T01:58:32.028073+00:00"
+    },
+    {
+      "id": "yolo11s-coco",
+      "role": "vehicle_detector",
+      "format": "pytorch",
+      "path": "vehicle_detector/yolo11s.pt",
+      "url": "https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11s.pt",
+      "source_revision": "ultralytics-assets-v8.3.0",
+      "license": "AGPL-3.0-or-Ultralytics-Enterprise",
+      "classes": [
+        "car",
+        "motorcycle",
+        "bus",
+        "truck"
+      ],
+      "sha256": "85a76fe86dd8afe384648546b56a7a78580c7cb7b404fc595f97969322d502d5",
+      "size_bytes": 19313732,
+      "verified_at": "2026-07-02T01:58:32.198850+00:00"
+    },
+    {
+      "id": "yolo26n-coco",
+      "role": "vehicle_detector",
+      "format": "pytorch",
+      "path": "vehicle_detector/yolo26n.pt",
+      "url": "https://github.com/ultralytics/assets/releases/latest/download/yolo26n.pt",
+      "source_revision": "ultralytics-assets-latest",
+      "license": "AGPL-3.0-or-Ultralytics-Enterprise",
+      "classes": [
+        "car",
+        "motorcycle",
+        "bus",
+        "truck"
+      ],
+      "stage": "experimental; validate on client footage before production promotion",
+      "sha256": "9b09cc8bf347f0fc8a5f7657480587f25db09b34bf33b0652110fb03a8ad4fef",
+      "size_bytes": 5544453,
+      "verified_at": "2026-07-02T01:58:32.245341+00:00"
+    },
+    {
+      "id": "yolo26s-coco",
+      "role": "vehicle_detector",
+      "format": "pytorch",
+      "path": "vehicle_detector/yolo26s.pt",
+      "url": "https://github.com/ultralytics/assets/releases/latest/download/yolo26s.pt",
+      "source_revision": "ultralytics-assets-latest",
+      "license": "AGPL-3.0-or-Ultralytics-Enterprise",
+      "classes": [
+        "car",
+        "motorcycle",
+        "bus",
+        "truck"
+      ],
+      "stage": "experimental; validate on client footage before production promotion",
+      "sha256": "646f8bc3fe0a656803d95c294f7852321748cb29d13466a1af8862e2db384a1b",
+      "size_bytes": 20422725,
+      "verified_at": "2026-07-02T01:58:32.394336+00:00"
+    },
+    {
+      "id": "rf-detr-nano-coco",
+      "role": "vehicle_detector",
+      "format": "pytorch",
+      "path": "vehicle_detector/rf-detr-nano.pth",
+      "url": "https://storage.googleapis.com/rfdetr/nano_coco/checkpoint_best_regular.pth",
+      "source_revision": "rfdetr-1.8.3",
+      "license": "Apache-2.0",
+      "classes": [
+        "car",
+        "motorcycle",
+        "bus",
+        "truck"
+      ],
+      "stage": "COCO baseline; validate and fine-tune on traffic footage",
+      "sha256": "d8d6b9ee57d4d0ed2b1f305163624712a0532cb7bce0c747317984fc5457440d",
+      "size_bytes": 366287238,
+      "verified_at": "2026-07-02T01:58:34.393788+00:00"
+    },
+    {
+      "id": "rf-detr-medium-coco",
+      "role": "vehicle_detector",
+      "format": "pytorch",
+      "path": "vehicle_detector/rf-detr-medium.pth",
+      "url": "https://storage.googleapis.com/rfdetr/medium_coco/checkpoint_best_regular.pth",
+      "source_revision": "rfdetr-1.8.3",
+      "license": "Apache-2.0",
+      "classes": [
+        "car",
+        "motorcycle",
+        "bus",
+        "truck"
+      ],
+      "stage": "COCO baseline; validate and fine-tune on traffic footage",
+      "sha256": "749ff6071828aaffac63e204c4f4135ed3d6cdae4d702e086c360edc3b5768c8",
+      "size_bytes": 404992918,
+      "verified_at": "2026-07-02T01:58:36.426912+00:00"
+    },
+    {
+      "id": "yolov8n-plate-ua-prototype",
+      "role": "plate_detector",
+      "format": "pytorch",
+      "path": "plate_detector/yolov8n_plate.pt",
+      "url": "https://huggingface.co/Murd0ck/LicensePlateDetector_YOLOv8n/resolve/7a255e44980db8152901d2316b7b112d4845812c/best.pt?download=true",
+      "source_revision": "7a255e44980db8152901d2316b7b112d4845812c",
+      "license": "CC-BY-4.0 plus Ultralytics base-model terms",
+      "classes": [
+        "license_plate"
+      ],
+      "stage": "prototype; production requires client-camera validation and fine-tuning",
+      "sha256": "f190495573f2ce30b875426de15c6f73f22b49e7690bf379f19f06d1281700c8",
+      "size_bytes": 18354689,
+      "verified_at": "2026-07-02T01:58:36.541434+00:00"
+    },
+    {
+      "id": "openimagemodels-yolov9t-384-plate",
+      "role": "plate_detector",
+      "format": "onnx",
+      "path": "plate_detector/openimagemodels_yolov9t_384.onnx",
+      "url": "https://github.com/ankandrew/open-image-models/releases/download/assets/yolo-v9-t-384-license-plates-end2end.onnx",
+      "source_revision": "open-image-models-assets",
+      "license": "MIT",
+      "classes": [
+        "license_plate"
+      ],
+      "stage": "CPU/edge candidate; validate on the frozen project benchmark",
+      "sha256": "888397b96d761c89db40bc9c305838e8652660f5e282c2cadebbe8d2951a77a8",
+      "size_bytes": 7771218,
+      "verified_at": "2026-07-02T01:58:36.591510+00:00"
+    },
+    {
+      "id": "yolo11n-plate-roboflow-v1",
+      "role": "plate_detector",
+      "format": "pytorch",
+      "path": "plate_detector/yolo11n_plate.pt",
+      "url": "https://huggingface.co/morsetechlab/yolov11-license-plate-detection/resolve/251a30d7daedca065f56e04b0af04052c907c68f/license-plate-finetune-v1n.pt?download=true",
+      "source_revision": "251a30d7daedca065f56e04b0af04052c907c68f",
+      "license": "AGPL-3.0",
+      "classes": [
+        "license_plate"
+      ],
+      "stage": "experimental; upstream dataset has train/test contamination, so only project-held-out metrics are valid",
+      "sha256": "0aec75976c56eb6f26dfb274c430620ec65137915ff1ae47c3a48c7af8afb7b2",
+      "size_bytes": 5465235,
+      "verified_at": "2026-07-02T01:58:36.633936+00:00"
+    }
+  ]
+}

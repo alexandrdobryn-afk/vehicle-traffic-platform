@@ -1,0 +1,102 @@
+{
+  "schema_version": 1,
+  "artifacts": [
+    {
+      "id": "yolo11n-coco",
+      "role": "vehicle_detector",
+      "format": "pytorch",
+      "path": "vehicle_detector/yolo11n.pt",
+      "url": "https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n.pt",
+      "source_revision": "ultralytics-assets-v8.3.0",
+      "license": "AGPL-3.0-or-Ultralytics-Enterprise",
+      "classes": ["car", "motorcycle", "bus", "truck"]
+    },
+    {
+      "id": "yolo11s-coco",
+      "role": "vehicle_detector",
+      "format": "pytorch",
+      "path": "vehicle_detector/yolo11s.pt",
+      "url": "https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11s.pt",
+      "source_revision": "ultralytics-assets-v8.3.0",
+      "license": "AGPL-3.0-or-Ultralytics-Enterprise",
+      "classes": ["car", "motorcycle", "bus", "truck"]
+    },
+    {
+      "id": "yolo26n-coco",
+      "role": "vehicle_detector",
+      "format": "pytorch",
+      "path": "vehicle_detector/yolo26n.pt",
+      "url": "https://github.com/ultralytics/assets/releases/latest/download/yolo26n.pt",
+      "source_revision": "ultralytics-assets-latest",
+      "license": "AGPL-3.0-or-Ultralytics-Enterprise",
+      "classes": ["car", "motorcycle", "bus", "truck"],
+      "stage": "experimental; validate on client footage before production promotion"
+    },
+    {
+      "id": "yolo26s-coco",
+      "role": "vehicle_detector",
+      "format": "pytorch",
+      "path": "vehicle_detector/yolo26s.pt",
+      "url": "https://github.com/ultralytics/assets/releases/latest/download/yolo26s.pt",
+      "source_revision": "ultralytics-assets-latest",
+      "license": "AGPL-3.0-or-Ultralytics-Enterprise",
+      "classes": ["car", "motorcycle", "bus", "truck"],
+      "stage": "experimental; validate on client footage before production promotion"
+    },
+    {
+      "id": "rf-detr-nano-coco",
+      "role": "vehicle_detector",
+      "format": "pytorch",
+      "path": "vehicle_detector/rf-detr-nano.pth",
+      "url": "https://storage.googleapis.com/rfdetr/nano_coco/checkpoint_best_regular.pth",
+      "source_revision": "rfdetr-1.8.3",
+      "license": "Apache-2.0",
+      "classes": ["car", "motorcycle", "bus", "truck"],
+      "stage": "COCO baseline; validate and fine-tune on traffic footage"
+    },
+    {
+      "id": "rf-detr-medium-coco",
+      "role": "vehicle_detector",
+      "format": "pytorch",
+      "path": "vehicle_detector/rf-detr-medium.pth",
+      "url": "https://storage.googleapis.com/rfdetr/medium_coco/checkpoint_best_regular.pth",
+      "source_revision": "rfdetr-1.8.3",
+      "license": "Apache-2.0",
+      "classes": ["car", "motorcycle", "bus", "truck"],
+      "stage": "COCO baseline; validate and fine-tune on traffic footage"
+    },
+    {
+      "id": "yolov8n-plate-ua-prototype",
+      "role": "plate_detector",
+      "format": "pytorch",
+      "path": "plate_detector/yolov8n_plate.pt",
+      "url": "https://huggingface.co/Murd0ck/LicensePlateDetector_YOLOv8n/resolve/7a255e44980db8152901d2316b7b112d4845812c/best.pt?download=true",
+      "source_revision": "7a255e44980db8152901d2316b7b112d4845812c",
+      "license": "CC-BY-4.0 plus Ultralytics base-model terms",
+      "classes": ["license_plate"],
+      "stage": "prototype; production requires client-camera validation and fine-tuning"
+    },
+    {
+      "id": "openimagemodels-yolov9t-384-plate",
+      "role": "plate_detector",
+      "format": "onnx",
+      "path": "plate_detector/openimagemodels_yolov9t_384.onnx",
+      "url": "https://github.com/ankandrew/open-image-models/releases/download/assets/yolo-v9-t-384-license-plates-end2end.onnx",
+      "source_revision": "open-image-models-assets",
+      "license": "MIT",
+      "classes": ["license_plate"],
+      "stage": "CPU/edge candidate; validate on the frozen project benchmark"
+    },
+    {
+      "id": "yolo11n-plate-roboflow-v1",
+      "role": "plate_detector",
+      "format": "pytorch",
+      "path": "plate_detector/yolo11n_plate.pt",
+      "url": "https://huggingface.co/morsetechlab/yolov11-license-plate-detection/resolve/251a30d7daedca065f56e04b0af04052c907c68f/license-plate-finetune-v1n.pt?download=true",
+      "source_revision": "251a30d7daedca065f56e04b0af04052c907c68f",
+      "license": "AGPL-3.0",
+      "classes": ["license_plate"],
+      "stage": "experimental; upstream dataset has train/test contamination, so only project-held-out metrics are valid"
+    }
+  ]
+}

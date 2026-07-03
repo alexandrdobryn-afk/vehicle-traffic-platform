@@ -1,0 +1,17 @@
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.gpu
+    gpus: all
+    shm_size: "2gb"
+    environment:
+      AI_INFERENCE_CONCURRENCY: "1"
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+
+  training-worker:
+    build:
+      context: ./training/backend
+      dockerfile: ../Dockerfile.worker
+    gpus: all

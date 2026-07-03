@@ -1,0 +1,28 @@
+# Training control-plane API only. GPU/CV training dependencies belong to
+# requirements.txt and are installed in Dockerfile.worker.
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+python-multipart==0.0.9
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+bcrypt==4.0.1
+pydantic==2.7.1
+pydantic-settings==2.2.1
+sqlalchemy==2.0.30
+alembic==1.13.1
+asyncpg==0.29.0
+psycopg2-binary==2.9.9
+celery==5.4.0
+redis==5.0.4
+aioredis==2.0.1
+flower==2.0.1
+opencv-python-headless==4.9.0.80
+numpy==1.26.4
+aiofiles==23.2.1
+python-magic==0.4.27
+httpx==0.27.0
+python-dotenv==1.0.1
+structlog==24.1.0
+websockets==12.0
+psutil==5.9.8
+gputil==1.4.0

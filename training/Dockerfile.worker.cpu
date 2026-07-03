@@ -1,0 +1,21 @@
+FROM python:3.11-bookworm
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgl1 libglib2.0-0 libsm6 libxext6 libgomp1 ffmpeg curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir torch==2.3.0+cpu torchvision==0.18.0+cpu \
+        --index-url https://download.pytorch.org/whl/cpu && \
+    pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+RUN mkdir -p /app/data/datasets /app/data/uploads /app/data/models \
+    /app/data/exports /app/data/logs /app/inference_models
+RUN useradd -m -u 1001 trainer && chown -R trainer:trainer /app
+USER trainer
+
+CMD ["celery", "-A", "app.celery_app", "worker", "--loglevel=info", \
+     "--queues=gpu,cpu", "--concurrency=1", "--hostname=cpu-worker@%h"]
