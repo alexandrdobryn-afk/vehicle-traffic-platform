@@ -97,6 +97,7 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 ```bash
 python scripts/download_models.py all
 python scripts/download_models.py --verify-only
+python scripts/download_models.py --write-lock  # Explicitly regenerate provenance after manifest changes
 ```
 
 ### 3. Start platform
@@ -187,6 +188,7 @@ Model binaries are intentionally excluded from Git. Their URLs, revisions, licen
 ```bash
 python scripts/download_models.py all
 python scripts/download_models.py --verify-only
+python scripts/download_models.py --write-lock  # Explicitly regenerate provenance after manifest changes
 ```
 
 **Option 2 — Train your own (recommended for production):**

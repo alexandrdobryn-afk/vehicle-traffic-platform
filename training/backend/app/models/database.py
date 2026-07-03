@@ -206,6 +206,17 @@ class TrainingJob(Base):
 
     dataset = relationship("Dataset")
     metrics_history = relationship("TrainingMetrics", back_populates="job", cascade="all, delete-orphan")
+    model_versions = relationship(
+        "ModelVersion",
+        foreign_keys="ModelVersion.job_id",
+        back_populates="job",
+    )
+    output_model = relationship(
+        "ModelVersion",
+        foreign_keys=[output_model_id],
+        uselist=False,
+        post_update=True,
+    )
 
 
 class TrainingMetrics(Base):
@@ -276,7 +287,11 @@ class ModelVersion(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now(), server_default=func.now())
 
-    job = relationship("TrainingJob")
+    job = relationship(
+        "TrainingJob",
+        foreign_keys=[job_id],
+        back_populates="model_versions",
+    )
     deploy_logs = relationship("DeployLog", back_populates="model_version", cascade="all, delete-orphan")
 
 

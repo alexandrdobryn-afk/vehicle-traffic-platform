@@ -97,6 +97,22 @@
       "license": "AGPL-3.0",
       "classes": ["license_plate"],
       "stage": "experimental; upstream dataset has train/test contamination, so only project-held-out metrics are valid"
+    },
+    {
+      "id": "brandeye-yolov8m",
+      "role": "brand_classifier",
+      "format": "pytorch",
+      "path": "brand_classifier/brandeye.pt",
+      "url": "https://huggingface.co/haydarkadioglu/brand-eye/resolve/89fa2b0af99aee85849764b251957f79bb0d57b8/brandeye.pt?download=true",
+      "source_revision": "89fa2b0af99aee85849764b251957f79bb0d57b8",
+      "license": "Apache-2.0 model card; Ultralytics YOLOv8 AGPL-3.0-or-Ultralytics-Enterprise base-model terms also apply",
+      "classes": [
+        "audi", "bmw", "byd", "cherry", "chevrolet", "citroen", "cupra", "dacia",
+        "fiat", "ford", "honda", "hyundai", "kia", "landrover", "mazda", "mercedes",
+        "mg", "mini", "mitsubishi", "nissan", "opel", "pegout", "porsche", "rangerover",
+        "renault", "seat", "skoda", "suzuki", "tesla", "togg", "toyota", "volvo", "wolksvogen"
+      ],
+      "stage": "prototype; validate on the frozen project benchmark before production use"
     }
   ]
 }

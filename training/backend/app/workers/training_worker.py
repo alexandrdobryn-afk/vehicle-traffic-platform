@@ -142,8 +142,21 @@ def _train_yolo(job, db, params: dict):
         # Synchronous export
         _export_dataset_sync(db, job.dataset_id, export_dir, dataset)
 
-    # Load model
-    model_path = f"{arch}.pt" if pretrained else f"{arch}.yaml"
+    # Prefer the model pack already mounted from the inference backend. This
+    # keeps the first training run reproducible and avoids a network download.
+    if pretrained:
+        model_dir = Path(settings.INFERENCE_MODELS_PATH) / (
+            "plate_detector" if job.model_type == "plate_detector" else "vehicle_detector"
+        )
+        local_candidates = [
+            model_dir / f"{arch}.pt",
+            model_dir / f"{arch}_plate.pt",
+        ]
+        local_model = next((path for path in local_candidates if path.exists()), None)
+        model_path = str(local_model) if local_model else f"{arch}.pt"
+    else:
+        model_path = f"{arch}.yaml"
+    logger.info("Loading YOLO model for job %s from %s", job_id, model_path)
     model = YOLO(model_path)
 
     # Output directory
@@ -236,6 +249,7 @@ def _train_yolo(job, db, params: dict):
 
     # Augmentation config
     aug = job.augmentation_config or {}
+    augmentation_enabled = aug.get("enabled", True)
     results = model.train(
         data=data_yaml,
         epochs=epochs,
@@ -253,16 +267,15 @@ def _train_yolo(job, db, params: dict):
         workers=params.get("workers", 4),
         half=params.get("half", False),
         # Augmentation
-        degrees=aug.get("rotation", 10),
-        scale=aug.get("scale_max", 1.2) - 1.0,
+        degrees=aug.get("rotation", 10) if augmentation_enabled else 0.0,
+        scale=(aug.get("scale_max", 1.2) - 1.0) if augmentation_enabled else 0.0,
         flipud=0.0,
-        fliplr=aug.get("horizontal_flip", 0.5),
-        mosaic=aug.get("mosaic", 0.5),
-        mixup=aug.get("mixup", 0.1),
-        hsv_h=aug.get("hue", 0.05),
-        hsv_s=aug.get("saturation", 0.2),
-        hsv_v=aug.get("brightness", 0.2),
-        blur=aug.get("blur", 0.1),
+        fliplr=aug.get("horizontal_flip", 0.5) if augmentation_enabled else 0.0,
+        mosaic=aug.get("mosaic", 0.5) if augmentation_enabled else 0.0,
+        mixup=aug.get("mixup", 0.1) if augmentation_enabled else 0.0,
+        hsv_h=aug.get("hue", 0.05) if augmentation_enabled else 0.0,
+        hsv_s=aug.get("saturation", 0.2) if augmentation_enabled else 0.0,
+        hsv_v=aug.get("brightness", 0.2) if augmentation_enabled else 0.0,
     )
 
     # Save best weights to model registry

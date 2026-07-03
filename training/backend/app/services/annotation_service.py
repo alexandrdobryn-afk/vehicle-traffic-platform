@@ -37,6 +37,7 @@ class AnnotationService:
             label=data.label,
             confidence=data.confidence,
             is_auto=data.is_auto,
+            **({"is_verified": data.is_verified} if data.is_verified is not None else {}),
         )
         db.add(ann)
 
@@ -68,6 +69,7 @@ class AnnotationService:
                 label=data.label,
                 confidence=data.confidence,
                 is_auto=data.is_auto,
+                **({"is_verified": data.is_verified} if data.is_verified is not None else {}),
             )
             db.add(ann)
             results.append(ann)

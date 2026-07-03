@@ -61,16 +61,6 @@ async def get_dataset(
     ds = await dataset_service.get_dataset(db, dataset_id)
     if not ds:
         raise HTTPException(404, "Dataset not found")
-    if str(ds.model_type) != str(data.model_type.value):
-        raise HTTPException(400, "Dataset model type does not match the training job")
-    allowed_architectures = {
-        "vehicle_detector": {"yolo11n", "yolo11s", "yolo11m", "yolov8n", "yolov8s"},
-        "plate_detector": {"yolo11n", "yolov8n"},
-        "color_classifier": {"mobilenetv3", "efficientnet", "resnet18"},
-        "ocr": {"lprnet"},
-    }
-    if data.architecture not in allowed_architectures.get(data.model_type.value, set()):
-        raise HTTPException(400, f"Unsupported architecture for {data.model_type.value}: {data.architecture}")
     return ds
 
 
@@ -347,6 +337,18 @@ async def create_job(
     ds = await dataset_service.get_dataset(db, data.dataset_id)
     if not ds:
         raise HTTPException(404, "Dataset not found")
+    model_type = data.model_type.value
+    if str(ds.model_type) != model_type:
+        raise HTTPException(400, "Dataset model type does not match the training job")
+
+    allowed_architectures = {
+        "vehicle_detector": {"yolo11n", "yolo11s", "yolo11m", "yolov8n", "yolov8s"},
+        "plate_detector": {"yolo11n", "yolov8n"},
+        "color_classifier": {"mobilenetv3", "efficientnet", "resnet18"},
+        "ocr": {"lprnet"},
+    }
+    if data.architecture not in allowed_architectures.get(model_type, set()):
+        raise HTTPException(400, f"Unsupported architecture for {model_type}: {data.architecture}")
 
     # Check if split exists
     result = await db.execute(
@@ -360,7 +362,7 @@ async def create_job(
 
     job = TrainingJob(
         name=data.name,
-        model_type=data.model_type,
+        model_type=model_type,
         architecture=data.architecture,
         dataset_id=data.dataset_id,
         hyperparams=data.hyperparams.model_dump(),

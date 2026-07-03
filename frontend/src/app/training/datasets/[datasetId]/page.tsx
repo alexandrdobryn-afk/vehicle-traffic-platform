@@ -8,6 +8,7 @@ import Link from 'next/link'
 import toast from 'react-hot-toast'
 import { useParams } from 'next/navigation'
 import { useTranslation } from '@/lib/i18n'
+import AuthenticatedTrainingImage from '@/components/training/AuthenticatedTrainingImage'
 
 export default function DatasetDetailPage() {
   const { t } = useTranslation()
@@ -21,8 +22,6 @@ export default function DatasetDetailPage() {
   const [splitting, setSplitting] = useState(false)
   const imgInputRef = useRef<HTMLInputElement>(null)
   const vidInputRef = useRef<HTMLInputElement>(null)
-  const TRAINING_URL = process.env.NEXT_PUBLIC_TRAINING_API_URL || 'http://localhost:8001'
-
   const [splitConfig, setSplitConfig] = useState({ train_ratio: 0.7, val_ratio: 0.2, test_ratio: 0.1, seed: 42 })
 
   const load = async () => {
@@ -226,11 +225,10 @@ export default function DatasetDetailPage() {
             <div className="grid grid-cols-5 md:grid-cols-8 gap-2">
               {images.map(img => (
                 <div key={img.id} className="relative aspect-square">
-                  <img
-                    src={`${TRAINING_URL}/api/v1/training/datasets/${datasetId}/images/${img.id}/file`}
+                  <AuthenticatedTrainingImage
+                    endpoint={`/datasets/${datasetId}/images/${img.id}/file`}
                     alt={img.filename}
                     className="w-full h-full object-cover rounded-lg border border-border"
-                    onError={e => { (e.target as HTMLImageElement).style.display = 'none' }}
                   />
                   {img.is_annotated && (
                     <span className="absolute top-0.5 right-0.5 w-2 h-2 bg-emerald-400 rounded-full border border-card" />

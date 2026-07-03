@@ -34,7 +34,8 @@ export default function DatasetsPage() {
   const [filter, setFilter] = useState('')
   const [form, setForm] = useState({
     name: '', description: '', model_type: 'vehicle_detector' as ModelType,
-    annotation_type: 'bbox' as AnnotationType, classes: [] as string[], tags: [] as string[],
+    annotation_type: 'bbox' as AnnotationType,
+    classes: [...DEFAULT_CLASSES.vehicle_detector], tags: [] as string[],
   })
   const [classInput, setClassInput] = useState('')
   const [loading, setLoading] = useState(false)
@@ -55,7 +56,10 @@ export default function DatasetsPage() {
       await trainingApi.post('/datasets', form)
       toast.success(t('Dataset created'))
       setShowModal(false)
-      setForm({ name: '', description: '', model_type: 'vehicle_detector', annotation_type: 'bbox', classes: [], tags: [] })
+      setForm({
+        name: '', description: '', model_type: 'vehicle_detector',
+        annotation_type: 'bbox', classes: [...DEFAULT_CLASSES.vehicle_detector], tags: [],
+      })
       load()
     } catch (e: any) { toast.error(e.response?.data?.detail || t('Error')) }
     finally { setLoading(false) }

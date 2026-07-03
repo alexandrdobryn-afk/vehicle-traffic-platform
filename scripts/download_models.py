@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Download approved baseline model artifacts and record their provenance."""
+"""Download or verify approved model artifacts and optionally update their provenance lock."""
 
 from __future__ import annotations
 
@@ -80,7 +80,16 @@ def main() -> int:
     parser.add_argument("models", nargs="*", default=["all"], help="Model ids or 'all'")
     parser.add_argument("--force", action="store_true", help="Redownload existing files")
     parser.add_argument("--verify-only", action="store_true", help="Do not use the network")
+    parser.add_argument(
+        "--write-lock",
+        action="store_true",
+        help="Write a complete manifest.lock.json after every manifest artifact passes verification",
+    )
     args = parser.parse_args()
+    if args.verify_only and args.write_lock:
+        parser.error("--verify-only and --write-lock are separate operations")
+    if args.write_lock and args.models != ["all"]:
+        parser.error("--write-lock requires the complete model set; do not select individual model ids")
 
     manifest = load_manifest()
     lock = {
@@ -118,9 +127,11 @@ def main() -> int:
             failed = True
             print(f"ERROR {artifact['id']}: {exc}", file=sys.stderr)
 
-    if lock["artifacts"]:
+    if args.write_lock and not failed and lock["artifacts"]:
         LOCK_PATH.write_text(json.dumps(lock, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         print(f"\nWrote provenance lock: {LOCK_PATH}")
+    elif args.write_lock and failed:
+        print("\nProvenance lock was not changed because verification failed.", file=sys.stderr)
     return 1 if failed else 0
 
 

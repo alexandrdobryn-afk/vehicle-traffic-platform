@@ -115,6 +115,7 @@ class AnnotationCreate(BaseModel):
     label: Optional[str] = None
     confidence: Optional[float] = None
     is_auto: bool = False
+    is_verified: Optional[bool] = None
 
 
 class AnnotationResponse(BaseModel):
@@ -197,7 +198,6 @@ class TrainingJobResponse(BaseModel):
     status: str
     celery_task_id: Optional[str]
     hyperparams: Optional[Dict[str, Any]]
-    artifact_metadata: Optional[Dict[str, Any]]
     current_epoch: int
     total_epochs: int
     progress_pct: float
@@ -267,6 +267,7 @@ class ModelVersionResponse(BaseModel):
     trt_path: Optional[str]
     metrics: Optional[Dict[str, Any]]
     hyperparams: Optional[Dict[str, Any]]
+    artifact_metadata: Optional[Dict[str, Any]]
     deploy_status: str
     is_production: bool
     validation_passed: Optional[bool]

@@ -5,12 +5,14 @@ import os
 from contextlib import asynccontextmanager
 
 import redis.asyncio as aioredis
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy import text
+from sqlalchemy.orm import configure_mappers
 
 from app.config import settings
-from app.models.database import init_db, get_db
+from app.models.database import engine, init_db, get_db
 from app.api.routers import (
     datasets_router, annotations_router, jobs_router,
     registry_router, gpu_router, arch_router,
@@ -39,6 +41,10 @@ async def lifespan(app: FastAPI):
 
     logger.info("🚀 Starting VTP Training Platform...")
 
+    # Configure every ORM relationship before advertising readiness. Metadata
+    # creation alone does not catch ambiguous relationships.
+    configure_mappers()
+
     # Create data directories
     for path in [
         settings.DATASETS_PATH, settings.UPLOADS_PATH,
@@ -63,7 +69,7 @@ async def lifespan(app: FastAPI):
     yield
 
     if redis_client:
-        await redis_client.close()
+        await redis_client.aclose()
 
 
 app = FastAPI(
@@ -195,7 +201,22 @@ async def training_ws(
 
 # ═══ HEALTH ══════════════════════════════════════════════════════
 @app.get("/api/v1/training/health")
-async def health():
+async def health(response: Response):
+    orm_ok = True
+    try:
+        configure_mappers()
+    except Exception:
+        logger.exception("Training ORM mapper readiness check failed")
+        orm_ok = False
+
+    database_ok = False
+    try:
+        async with engine.connect() as connection:
+            await connection.execute(text("SELECT 1"))
+        database_ok = True
+    except Exception:
+        logger.exception("Training database readiness check failed")
+
     redis_ok = False
     if redis_client:
         try:
@@ -214,8 +235,14 @@ async def health():
     except Exception:
         pass
 
+    ready = orm_ok and database_ok and redis_ok and workers_ok
+    if not ready:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+
     return {
-        "status": "ok",
+        "status": "ok" if ready else "degraded",
+        "orm": "ok" if orm_ok else "error",
+        "database": "ok" if database_ok else "error",
         "redis": "ok" if redis_ok else "unavailable",
         "celery_workers": "ok" if workers_ok else "no workers",
         "version": "1.0.0",

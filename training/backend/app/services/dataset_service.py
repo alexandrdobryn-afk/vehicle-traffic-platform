@@ -56,6 +56,7 @@ class DatasetService:
         dataset.storage_path = str(ds_path)
         dataset.status = "ready"
         await db.commit()
+        await db.refresh(dataset)
         return dataset
 
     async def get_dataset(self, db: AsyncSession, dataset_id: int) -> Optional[Dataset]:
