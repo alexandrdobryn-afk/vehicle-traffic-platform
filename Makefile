@@ -2,11 +2,11 @@
 
 # ── Start ──────────────────────────────────────────────────────────
 up:
-	docker compose up
+	bash scripts/start.sh --foreground
 up-d:
-	docker compose up -d
+	bash scripts/start.sh
 up-monitor:
-	docker compose --profile monitoring up -d
+	bash scripts/start.sh --profile monitoring
 
 # ── Build ──────────────────────────────────────────────────────────
 build:

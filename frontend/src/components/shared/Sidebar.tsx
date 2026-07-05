@@ -4,7 +4,7 @@ import { usePathname } from 'next/navigation'
 import {
   LayoutDashboard, Camera, PlayCircle, List, Car,
   BarChart2, AlertTriangle, Settings, Activity, LogOut,
-  Shield, Zap, Database, Archive, ChevronDown, ChevronRight, FileVideo
+  Shield, Zap, Database, Archive, ChevronDown, ChevronRight, FileVideo, ScanSearch
 } from 'lucide-react'
 import { useAuth } from '@/hooks/useAuth'
 import { cn } from '@/lib/utils'
@@ -26,6 +26,7 @@ const NAV_INFERENCE = [
 
 const NAV_TRAINING = [
   { href: '/training', label: 'Training Hub', icon: Zap },
+  { href: '/training/gemini-review', label: 'Gemini Review', icon: ScanSearch },
   { href: '/training/datasets', label: 'Datasets', icon: Database },
   { href: '/training/jobs', label: 'Jobs', icon: PlayCircle },
   { href: '/training/registry', label: 'Model Registry', icon: Archive },

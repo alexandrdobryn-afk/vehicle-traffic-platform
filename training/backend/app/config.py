@@ -35,6 +35,7 @@ class TrainingSettings(BaseSettings):
 
     # Inference backend models dir (for deploy)
     INFERENCE_MODELS_PATH: str = "/app/inference_models"
+    SOURCE_STORAGE_PATH: str = "/app/source_storage"
 
     # Training defaults
     DEFAULT_EPOCHS: int = 100

@@ -31,6 +31,11 @@ class Camera(Base):
     is_active = Column(Boolean, default=False)
     save_crops = Column(Boolean, default=True)
     anonymization = Column(Boolean, default=False)
+    gemini_enabled = Column(Boolean, nullable=False, default=False, server_default="false")
+    gemini_verify_predictions = Column(Boolean, nullable=False, default=True, server_default="true")
+    gemini_collect_training = Column(Boolean, nullable=False, default=True, server_default="true")
+    gemini_sample_interval_seconds = Column(Integer, nullable=False, default=30, server_default="30")
+    gemini_max_candidates_per_run = Column(Integer, nullable=False, default=25, server_default="25")
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now(), server_default=func.now())
 
@@ -144,6 +149,34 @@ class AppSettings(Base):
     updated_at = Column(DateTime(timezone=True), onupdate=func.now(), server_default=func.now())
 
 
+class GeminiReviewCandidate(Base):
+    __tablename__ = "gemini_review_candidates"
+
+    id = Column(Integer, primary_key=True, index=True)
+    camera_id = Column(Integer, ForeignKey("cameras.id", ondelete="CASCADE"), nullable=False, index=True)
+    processing_run_id = Column(String(64), nullable=False, index=True)
+    track_id = Column(Integer, nullable=True, index=True)
+    status = Column(String(30), nullable=False, default="processing", server_default="processing", index=True)
+    selection_reason = Column(String(100), nullable=False, default="representative_track")
+    frame_path = Column(String(500), nullable=False)
+    mask_path = Column(String(500), nullable=True)
+    frame_width = Column(Integer, nullable=False)
+    frame_height = Column(Integer, nullable=False)
+    target_model_type = Column(String(50), nullable=False, default="vehicle_segmenter")
+    local_predictions = Column(JSON, nullable=True, default=list)
+    gemini_verification = Column(JSON, nullable=True)
+    proposed_annotations = Column(JSON, nullable=True, default=list)
+    raw_response = Column(JSON, nullable=True)
+    provider_model = Column(String(100), nullable=True)
+    response_id = Column(String(255), nullable=True)
+    usage_metadata = Column(JSON, nullable=True)
+    error_message = Column(Text, nullable=True)
+    reviewed_by = Column(String(255), nullable=True)
+    reviewed_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now(), server_default=func.now())
+
+
 # Database engine setup
 engine = create_async_engine(
     settings.DATABASE_URL,
@@ -200,6 +233,18 @@ def _ensure_camera_source_columns(sync_conn):
         ))
     if "pipeline_config" not in columns:
         sync_conn.execute(text("ALTER TABLE cameras ADD COLUMN pipeline_config JSON"))
+    gemini_columns = {
+        "gemini_enabled": "BOOLEAN NOT NULL DEFAULT false",
+        "gemini_verify_predictions": "BOOLEAN NOT NULL DEFAULT true",
+        "gemini_collect_training": "BOOLEAN NOT NULL DEFAULT true",
+        "gemini_sample_interval_seconds": "INTEGER NOT NULL DEFAULT 30",
+        "gemini_max_candidates_per_run": "INTEGER NOT NULL DEFAULT 25",
+    }
+    for column_name, definition in gemini_columns.items():
+        if column_name not in columns:
+            sync_conn.execute(text(
+                f"ALTER TABLE cameras ADD COLUMN {column_name} {definition}"
+            ))
 
 
 def _ensure_vehicle_track_columns(sync_conn):

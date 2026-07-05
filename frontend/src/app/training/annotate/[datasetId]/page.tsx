@@ -94,6 +94,13 @@ export default function AnnotatePage() {
   }
 
   const annotationBox = (ann: TAnnotation): NormalizedBox | null => {
+    if (ann.polygon && ann.polygon.length >= 3) {
+      const xs = ann.polygon.map(point => point[0])
+      const ys = ann.polygon.map(point => point[1])
+      const left = Math.min(...xs), right = Math.max(...xs)
+      const top = Math.min(...ys), bottom = Math.max(...ys)
+      return { xCenter: (left + right) / 2, yCenter: (top + bottom) / 2, width: right - left, height: bottom - top }
+    }
     if (
       ann.x_center == null || ann.y_center == null ||
       ann.bbox_width == null || ann.bbox_height == null
@@ -120,7 +127,6 @@ export default function AnnotatePage() {
 
     // Draw saved annotations
     annotations.forEach((ann) => {
-      if (ann.annotation_type !== 'bbox') return
       const stored = annotationBox(ann)
       if (!stored) return
       const box = draftEdit?.annotationId === ann.id ? draftEdit : stored
@@ -131,13 +137,28 @@ export default function AnnotatePage() {
       const color = CLASS_COLORS[ann.class_id || 0] || CLASS_COLORS[0]
       const selected = ann.id === selectedAnnotationId
 
-      ctx.strokeStyle = color
-      ctx.lineWidth = selected ? 4 : 2
-      ctx.strokeRect(x, y, w, h)
-      ctx.fillStyle = color + '30'
-      ctx.fillRect(x, y, w, h)
+      if (ann.annotation_type === 'segmentation' && ann.polygon && ann.polygon.length >= 3) {
+        ctx.beginPath()
+        ann.polygon.forEach((point, index) => {
+          const px = point[0] * W, py = point[1] * H
+          if (index === 0) ctx.moveTo(px, py)
+          else ctx.lineTo(px, py)
+        })
+        ctx.closePath()
+        ctx.strokeStyle = color
+        ctx.lineWidth = selected ? 4 : 2
+        ctx.stroke()
+        ctx.fillStyle = color + '35'
+        ctx.fill()
+      } else if (ann.annotation_type === 'bbox') {
+        ctx.strokeStyle = color
+        ctx.lineWidth = selected ? 4 : 2
+        ctx.strokeRect(x, y, w, h)
+        ctx.fillStyle = color + '30'
+        ctx.fillRect(x, y, w, h)
+      } else return
 
-      if (selected) {
+      if (selected && ann.annotation_type === 'bbox') {
         const handleSize = 10
         ctx.fillStyle = '#fff'
         ctx.strokeStyle = '#111827'
@@ -204,6 +225,9 @@ export default function AnnotatePage() {
       y_center: changes.yCenter ?? box.yCenter,
       bbox_width: changes.width ?? box.width,
       bbox_height: changes.height ?? box.height,
+      polygon: ann.polygon,
+      mask_path: ann.mask_path,
+      provenance: ann.provenance,
       confidence: ann.confidence,
       is_auto: false,
       is_verified: true,
@@ -212,6 +236,7 @@ export default function AnnotatePage() {
   }
 
   const getResizeHandle = (ann: TAnnotation, x: number, y: number): ResizeHandle | null => {
+    if (ann.annotation_type === 'segmentation') return null
     const canvas = canvasRef.current
     const box = annotationBox(ann)
     if (!canvas || !box) return null
@@ -276,6 +301,7 @@ export default function AnnotatePage() {
     if (hit && hitBox) {
       setSelectedAnnotationId(hit.id)
       setSelectedClass(hit.class_id ?? 0)
+      if (hit.annotation_type === 'segmentation') return
       setEditInteraction({
         mode: 'move', annotationId: hit.id,
         startX: x, startY: y, original: hitBox,

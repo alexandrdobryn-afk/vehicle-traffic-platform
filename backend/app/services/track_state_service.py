@@ -51,6 +51,7 @@ class ActiveTrack:
             "track_id": self.track_id,
             "camera_id": self.camera_id,
             "vehicle_class": self.vehicle_class,
+            "detection_confidence": round(self.best_detection_conf, 3),
             "bbox": self.bbox,
             "color": self.color,
             "color_confidence": self.color_confidence,

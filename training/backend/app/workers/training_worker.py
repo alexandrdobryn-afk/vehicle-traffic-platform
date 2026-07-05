@@ -79,7 +79,7 @@ def run_training(self: Task, job_id: int):
         model_type = job.model_type
 
         # Dispatch to correct trainer
-        if model_type in ("vehicle_detector", "plate_detector"):
+        if model_type in ("vehicle_detector", "plate_detector", "vehicle_segmenter", "plate_segmenter"):
             _train_yolo(job, db, params)
         elif model_type == "color_classifier":
             _train_color_classifier(job, db, params)
@@ -146,7 +146,7 @@ def _train_yolo(job, db, params: dict):
     # keeps the first training run reproducible and avoids a network download.
     if pretrained:
         model_dir = Path(settings.INFERENCE_MODELS_PATH) / (
-            "plate_detector" if job.model_type == "plate_detector" else "vehicle_detector"
+            "plate_detector" if job.model_type in {"plate_detector", "plate_segmenter"} else "vehicle_detector"
         )
         local_candidates = [
             model_dir / f"{arch}.pt",
@@ -182,11 +182,13 @@ def _train_yolo(job, db, params: dict):
         loss_items = trainer.loss_items
 
         train_loss = float(sum(loss_items)) if loss_items is not None else None
-        val_loss = metrics.get("val/box_loss")
-        precision = metrics.get("metrics/precision(B)", 0)
-        recall = metrics.get("metrics/recall(B)", 0)
-        map50 = metrics.get("metrics/mAP50(B)", 0)
-        map50_95 = metrics.get("metrics/mAP50-95(B)", 0)
+        is_segmenter = job.model_type.endswith("_segmenter")
+        metric_suffix = "M" if is_segmenter else "B"
+        val_loss = metrics.get("val/seg_loss" if is_segmenter else "val/box_loss")
+        precision = metrics.get(f"metrics/precision({metric_suffix})", 0)
+        recall = metrics.get(f"metrics/recall({metric_suffix})", 0)
+        map50 = metrics.get(f"metrics/mAP50({metric_suffix})", 0)
+        map50_95 = metrics.get(f"metrics/mAP50-95({metric_suffix})", 0)
         lr_val = trainer.optimizer.param_groups[0]["lr"] if trainer.optimizer else None
 
         gpu_mem, gpu_util = _get_gpu_stats()
@@ -873,11 +875,13 @@ def _register_trained_model(db, job, weights_path: str, results):
         metrics = results
     else:
         try:
+            metric_suffix = "M" if job.model_type.endswith("_segmenter") else "B"
             metrics = {
-                "map50": float(results.results_dict.get("metrics/mAP50(B)", 0)),
-                "map50_95": float(results.results_dict.get("metrics/mAP50-95(B)", 0)),
-                "precision": float(results.results_dict.get("metrics/precision(B)", 0)),
-                "recall": float(results.results_dict.get("metrics/recall(B)", 0)),
+                "map50": float(results.results_dict.get(f"metrics/mAP50({metric_suffix})", 0)),
+                "map50_95": float(results.results_dict.get(f"metrics/mAP50-95({metric_suffix})", 0)),
+                "precision": float(results.results_dict.get(f"metrics/precision({metric_suffix})", 0)),
+                "recall": float(results.results_dict.get(f"metrics/recall({metric_suffix})", 0)),
+                "metric_type": "mask" if metric_suffix == "M" else "box",
             }
         except Exception:
             metrics = {}
@@ -901,7 +905,7 @@ def _register_trained_model(db, job, weights_path: str, results):
             "dataset_id": job.dataset_id,
             "license": (
                 "AGPL-3.0-or-Ultralytics-Enterprise"
-                if job.model_type in ("vehicle_detector", "plate_detector")
+                if job.model_type in ("vehicle_detector", "plate_detector", "vehicle_segmenter", "plate_segmenter")
                 else "project-training-output"
             ),
             "weights": artifact_info(weights_path),
@@ -960,17 +964,27 @@ def _export_dataset_sync(db, dataset_id, export_dir, dataset):
         if os.path.exists(img.file_path):
             shutil.copy2(img.file_path, dest)
 
+        annotation_type = "segmentation" if str(dataset.annotation_type) == "segmentation" else "bbox"
         anns = db.query(Annotation).filter(
             Annotation.image_id == img.id,
-            Annotation.annotation_type == "bbox",
+            Annotation.annotation_type == annotation_type,
         ).all()
         label_file = export_dir / split / "labels" / (Path(img.filename).stem + ".txt")
         with open(label_file, "w") as f:
             for ann in anns:
-                f.write(
-                    f"{ann.class_id or 0} {ann.x_center:.6f} {ann.y_center:.6f} "
-                    f"{ann.bbox_width:.6f} {ann.bbox_height:.6f}\n"
-                )
+                if annotation_type == "segmentation":
+                    polygon = ann.polygon or []
+                    if len(polygon) < 3:
+                        continue
+                    coordinates = " ".join(
+                        f"{float(point[0]):.6f} {float(point[1]):.6f}" for point in polygon
+                    )
+                    f.write(f"{ann.class_id or 0} {coordinates}\n")
+                else:
+                    f.write(
+                        f"{ann.class_id or 0} {ann.x_center:.6f} {ann.y_center:.6f} "
+                        f"{ann.bbox_width:.6f} {ann.bbox_height:.6f}\n"
+                    )
 
     import yaml
     with open(export_dir / "data.yaml", "w") as f:

@@ -24,6 +24,7 @@ class DatasetStatus(str, enum.Enum):
 
 class AnnotationType(str, enum.Enum):
     BBOX = "bbox"
+    SEGMENTATION = "segmentation"
     CLASSIFICATION = "classification"
     OCR = "ocr"
 
@@ -42,6 +43,8 @@ class JobStatus(str, enum.Enum):
 class ModelType(str, enum.Enum):
     VEHICLE_DETECTOR = "vehicle_detector"
     PLATE_DETECTOR = "plate_detector"
+    VEHICLE_SEGMENTER = "vehicle_segmenter"
+    PLATE_SEGMENTER = "plate_segmenter"
     OCR = "ocr"
     COLOR_CLASSIFIER = "color_classifier"
 
@@ -154,6 +157,10 @@ class Annotation(Base):
     y_center = Column(Float, nullable=True)
     bbox_width = Column(Float, nullable=True)
     bbox_height = Column(Float, nullable=True)
+    # Instance segmentation (normalized polygon points and optional source mask)
+    polygon = Column(JSON, nullable=True)
+    mask_path = Column(String(1000), nullable=True)
+    provenance = Column(JSON, nullable=True)
     # OCR
     ocr_text = Column(String(50), nullable=True)
     # Classification
@@ -339,4 +346,13 @@ async def init_db():
         await conn.execute(text(
             "ALTER TABLE tr_model_versions "
             "ADD COLUMN IF NOT EXISTS artifact_metadata JSON"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE tr_annotations ADD COLUMN IF NOT EXISTS polygon JSON"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE tr_annotations ADD COLUMN IF NOT EXISTS mask_path VARCHAR(1000)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE tr_annotations ADD COLUMN IF NOT EXISTS provenance JSON"
         ))

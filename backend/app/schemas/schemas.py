@@ -121,6 +121,11 @@ class CameraCreate(BaseModel):
     max_fps: int = Field(default=25, ge=1, le=60)
     save_crops: bool = True
     anonymization: bool = False
+    gemini_enabled: bool = False
+    gemini_verify_predictions: bool = True
+    gemini_collect_training: bool = True
+    gemini_sample_interval_seconds: int = Field(default=30, ge=5, le=3600)
+    gemini_max_candidates_per_run: int = Field(default=25, ge=1, le=500)
 
     @field_validator("pipeline_config")
     @classmethod
@@ -146,6 +151,11 @@ class CameraUpdate(BaseModel):
     max_fps: Optional[int] = None
     save_crops: Optional[bool] = None
     anonymization: Optional[bool] = None
+    gemini_enabled: Optional[bool] = None
+    gemini_verify_predictions: Optional[bool] = None
+    gemini_collect_training: Optional[bool] = None
+    gemini_sample_interval_seconds: Optional[int] = Field(default=None, ge=5, le=3600)
+    gemini_max_candidates_per_run: Optional[int] = Field(default=None, ge=1, le=500)
 
     @field_validator("pipeline_config")
     @classmethod
@@ -178,6 +188,11 @@ class CameraResponse(BaseModel):
     is_active: bool
     save_crops: bool
     anonymization: bool
+    gemini_enabled: bool = False
+    gemini_verify_predictions: bool = True
+    gemini_collect_training: bool = True
+    gemini_sample_interval_seconds: int = 30
+    gemini_max_candidates_per_run: int = 25
     created_at: datetime
     updated_at: datetime
 
@@ -338,6 +353,33 @@ class AppSettingsSchema(BaseModel):
     minimum_plate_height: int = Field(default=20, ge=10, le=150)
     save_crops: bool = True
     anonymization_mode: bool = False
+
+
+class GeminiSettingsUpdate(BaseModel):
+    api_key: Optional[str] = Field(default=None, min_length=10, max_length=500)
+    model: str = Field(default="gemini-2.5-flash", min_length=3, max_length=100)
+    enabled: bool = True
+    request_timeout_seconds: int = Field(default=45, ge=10, le=120)
+    max_concurrent_requests: int = Field(default=1, ge=1, le=4)
+
+
+class GeminiCandidateReview(BaseModel):
+    status: Literal["approved", "rejected"]
+    class_name: Optional[str] = Field(default=None, min_length=1, max_length=80)
+    annotation_index: int = Field(default=0, ge=0, le=100)
+    polygon: Optional[List[List[float]]] = None
+
+    @field_validator("polygon")
+    @classmethod
+    def validate_polygon(cls, value):
+        if value is None:
+            return value
+        if len(value) < 3:
+            raise ValueError("A segmentation polygon requires at least three points")
+        for point in value:
+            if len(point) != 2 or any(coord < 0 or coord > 1 for coord in point):
+                raise ValueError("Polygon coordinates must be normalized pairs between 0 and 1")
+        return value
 
 
 class PlateCandidate(BaseModel):

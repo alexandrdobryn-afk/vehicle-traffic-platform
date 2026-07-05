@@ -31,7 +31,7 @@ def run_validation(self, model_version_id: int):
             return {"success": False, "error": "Weights not found"}
 
         # Run validation
-        if model_type in ("vehicle_detector", "plate_detector"):
+        if model_type in ("vehicle_detector", "plate_detector", "vehicle_segmenter", "plate_segmenter"):
             val_results = _validate_yolo(mv, db)
         elif model_type == "color_classifier":
             val_results = _validate_classifier(mv, db)
@@ -286,7 +286,7 @@ def _run_auto_tests(mv) -> dict:
         results["tests"]["onnx_valid"] = None  # not exported yet
 
     # 4. Speed test (inference time)
-    if mv.model_type in ("vehicle_detector", "plate_detector") and weights_ok:
+    if mv.model_type in ("vehicle_detector", "plate_detector", "vehicle_segmenter", "plate_segmenter") and weights_ok:
         try:
             import time
             import numpy as np

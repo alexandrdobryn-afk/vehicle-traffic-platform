@@ -12,17 +12,22 @@ import { useTranslation } from '@/lib/i18n'
 const MODEL_TYPES: { value: ModelType; label: string }[] = [
   { value: 'vehicle_detector', label: 'Vehicle Detector' },
   { value: 'plate_detector', label: 'Plate Detector' },
+  { value: 'vehicle_segmenter', label: 'Vehicle Segmenter' },
+  { value: 'plate_segmenter', label: 'Plate Segmenter' },
   { value: 'ocr', label: 'OCR' },
   { value: 'color_classifier', label: 'Color Classifier' },
 ]
 const ANN_TYPES: { value: AnnotationType; label: string }[] = [
   { value: 'bbox', label: 'Bounding Box' },
+  { value: 'segmentation', label: 'Segmentation Mask' },
   { value: 'classification', label: 'Classification' },
   { value: 'ocr', label: 'OCR Text' },
 ]
 const DEFAULT_CLASSES: Record<ModelType, string[]> = {
   vehicle_detector: ['car', 'truck', 'bus', 'motorcycle', 'van'],
   plate_detector: ['license_plate'],
+  vehicle_segmenter: ['car', 'truck', 'bus', 'motorcycle', 'van'],
+  plate_segmenter: ['license_plate'],
   color_classifier: ['black', 'white', 'gray', 'silver', 'red', 'blue', 'green', 'yellow', 'orange', 'brown', 'beige'],
   ocr: [],
 }

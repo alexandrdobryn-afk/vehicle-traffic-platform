@@ -21,7 +21,10 @@ Professional AI-powered vehicle traffic analysis platform with real-time detecti
 | Alerts | Frontend / Webhook / Telegram |
 | AI Modes | Four core presets, three experimental presets, and manual pipeline selection |
 | Compute Runtime | Automatic / CPU / NVIDIA CUDA, FP32 quality policy |
-| Storage | PostgreSQL + Redis + local crops |
+| Training Platform | Dataset lifecycle, annotation, train/validation/test splits, jobs, validation, model registry and rollback |
+| Segmentation Training | YOLO11 instance segmentation for vehicles and license plates |
+| Gemini Assistance | Opt-in detection review and human-approved mask collection from selected real frames |
+| Storage | PostgreSQL + Redis + local crops, datasets and model artifacts |
 
 ---
 
@@ -52,11 +55,22 @@ MJPEG stream         (annotated video)
 Next.js Dashboard
 ```
 
+Optional training-data path:
+
+```text
+Selected real track frame → Gemini verification + instance masks
+    → authenticated review queue → human approval
+    → segmentation dataset → explicit split → Training Job
+    → validation → manual registry approval/deployment
+```
+
 ---
 
 ## 🛠 Tech Stack
 
-**Backend:** Python 3.11, FastAPI, OpenCV, PyTorch, Ultralytics YOLO11, PaddleOCR, EasyOCR, ByteTrack, SQLAlchemy, PostgreSQL, Redis, JWT
+**Inference backend:** Python 3.11, FastAPI, OpenCV, PyTorch, Ultralytics YOLO11, PaddleOCR, EasyOCR, ByteTrack, SQLAlchemy, PostgreSQL, Redis, JWT
+
+**Training backend:** FastAPI, Celery, Redis, PyTorch/Ultralytics, dataset annotation and model registry services
 
 **Frontend:** Next.js 15, React 18, TypeScript, Tailwind CSS, Recharts, WebSocket
 
@@ -75,7 +89,7 @@ Next.js Dashboard
 ### 1. Clone and configure
 
 ```bash
-git clone <repo>
+git clone https://github.com/alexandrdobryn-afk/vehicle-traffic-platform.git
 cd vehicle-traffic-platform
 cp .env.example .env
 ```
@@ -103,14 +117,23 @@ python scripts/download_models.py --write-lock  # Explicitly regenerate provenan
 ### 3. Start platform
 
 ```bash
-# Development (no GPU)
-docker compose up --build
+# Recommended Windows/WSL launch (automatically selects NVIDIA CUDA or CPU)
+.\start.cmd
 
-# Production with Nginx
-docker compose --profile production up --build
+# PowerShell equivalent
+.\start.ps1
 
-# With NVIDIA GPU
-docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build
+# Rebuild images when dependencies or Dockerfiles changed
+.\start.ps1 -Build
+
+# Explicit CPU launch
+.\start.ps1 -Cpu
+
+# Production profile with Nginx
+.\start.ps1 -Profile production
+
+# Linux/WSL equivalent
+bash scripts/start.sh
 ```
 
 ### 4. Access
@@ -118,8 +141,10 @@ docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build
 | Service | URL |
 |---|---|
 | Dashboard | http://localhost:3000 |
-| API Docs | http://localhost:8000/docs |
-| Health | http://localhost:8000/api/v1/health |
+| Inference API docs | http://localhost:8000/docs |
+| Training API docs | http://localhost:8001/docs |
+| Inference health | http://localhost:8000/api/v1/health |
+| Training health | http://localhost:8001/api/v1/training/health |
 
 Development credentials come from `INITIAL_ADMIN_EMAIL` and `INITIAL_ADMIN_PASSWORD` in `.env`. Production rejects the example password and secret.
 
@@ -131,7 +156,8 @@ Development credentials come from `INITIAL_ADMIN_EMAIL` and `INITIAL_ADMIN_PASSW
 2. Click **Add Camera**
 3. Select RTSP, HLS, MJPEG or JPEG snapshot and enter the source URL
 4. Select AI Mode (Balanced recommended)
-5. Click **Save** → **Start**
+5. Optionally enable Gemini verification/training capture; only selected frames are sent
+6. Click **Save** → **Start**
 
 The system auto-restarts cameras on platform restart.
 
@@ -212,7 +238,7 @@ The system automatically uses HSV+KMeans if no ONNX model is found. This is a he
 **Option 2 — Train MobileNetV3:**
 ```bash
 # Datasets: UFPR-VCR, Vehicle Color Recognition Dataset
-# See docs/TRAINING.md for full training pipeline
+# Use AI Training in the dashboard for dataset, job and registry management
 python scripts/train_color_classifier.py
 ```
 
@@ -252,6 +278,35 @@ GET /api/v1/tracks            ?plate=&color=&camera_id=
 GET /api/v1/tracks/active
 GET /api/v1/events            ?event_type=&date_from=&date_to=
 GET /api/v1/events/export     ?format=csv|excel|json
+```
+
+### Gemini settings and review
+```text
+GET  /api/v1/settings/gemini
+PUT  /api/v1/settings/gemini
+POST /api/v1/settings/gemini/test
+
+GET   /api/v1/gemini/candidates
+GET   /api/v1/gemini/candidates/{id}
+GET   /api/v1/gemini/candidates/{id}/image
+GET   /api/v1/gemini/candidates/{id}/mask
+PATCH /api/v1/gemini/candidates/{id}/review
+POST  /api/v1/gemini/candidates/{id}/retry
+```
+
+### Training API (`:8001`)
+```text
+GET  /api/v1/training/datasets
+POST /api/v1/training/datasets
+POST /api/v1/training/datasets/import-gemini
+POST /api/v1/training/datasets/{id}/split
+
+GET  /api/v1/training/jobs
+POST /api/v1/training/jobs
+GET  /api/v1/training/registry
+POST /api/v1/training/registry/{id}/validate
+POST /api/v1/training/registry/{id}/approve
+POST /api/v1/training/registry/rollback
 ```
 
 ### Video Stream
@@ -306,9 +361,31 @@ Payload: `{ type, plate, camera_id, description, payload }`
 
 ---
 
+## Gemini-assisted review and training capture
+
+Gemini integration is opt-in and disabled until an administrator configures an API key in **Settings -> Gemini API**. The key is encrypted by the backend and is never returned to the browser.
+
+For each camera or recorded video, the operator can independently enable detection verification, segmentation-mask collection, a minimum sampling interval, and a maximum candidate count per processing run. The full stream is never uploaded: VTP selects bounded representative track frames and stores the results in **AI Training -> Gemini Review**.
+
+A human must approve candidates before importing them into a `vehicle_segmenter` or `plate_segmenter` dataset. Approved annotations retain source, provider, camera, run and track provenance. The resulting dataset still requires an explicit train/validation/test split and Training Job. Gemini responses never trigger automatic online learning or production deployment; evaluate trained models on a separate real holdout before registry approval.
+
+Gemini produces structured instance masks, not tracker labels. These datasets train segmentation models (`yolo11n-seg` / `yolo11s-seg`); connecting a deployed segmenter to the live tracking pipeline remains an explicit integration decision rather than an automatic side effect.
+
+### Training workflow
+
+1. Create or import a dataset and verify its annotations.
+2. Create a deterministic train/validation/test split.
+3. Start a compatible Training Job.
+4. Review metrics and run model validation.
+5. Approve a model version manually in the registry, or reject/roll back it.
+
+Supported model families include vehicle/plate detectors, vehicle/plate segmenters, color classifiers and OCR. Export and deployment support depends on the selected architecture and installed runtime.
+
+---
+
 ## 🗄 Database Schema
 
-Key tables: `cameras`, `vehicle_tracks`, `plate_candidates`, `events`, `users`, `watchlist`, `system_logs`, `app_settings`
+Key tables: `cameras`, `vehicle_tracks`, `plate_candidates`, `events`, `users`, `watchlist`, `system_logs`, `app_settings`, `gemini_review_candidates`, and the `tr_*` training tables.
 
 All RTSP credentials stored encrypted (Fernet AES-128-CBC).
 
@@ -332,7 +409,9 @@ All RTSP credentials stored encrypted (Fernet AES-128-CBC).
 
 - Default admin password **must** be changed in production
 - RTSP URLs encrypted at rest with Fernet (AES-128)
-- All API endpoints require JWT token
+- Gemini API keys encrypted at rest and never returned to the browser
+- Protected inference and training endpoints require JWT tokens and role checks
+- Gemini candidate images and masks are served only through authenticated endpoints
 - WebSocket requires token via query param
 - Role-based access: `admin > operator > viewer`
 - Change `SECRET_KEY` in `.env` before production deploy
@@ -375,6 +454,7 @@ vehicle-traffic-platform/
 │   │   │   └── model_registry.py  AI model config
 │   │   ├── services/
 │   │   │   ├── inference_service.py     Main pipeline
+│   │   │   ├── gemini_training_service.py
 │   │   │   ├── vehicle_detection_service.py
 │   │   │   ├── tracking_service.py
 │   │   │   ├── plate_detection_service.py
@@ -391,6 +471,13 @@ vehicle-traffic-platform/
 │   ├── models/                  AI model weights
 │   ├── requirements.txt
 │   └── Dockerfile
+├── training/
+│   ├── backend/app/
+│   │   ├── api/routers.py       Dataset, job, registry and Gemini-import API
+│   │   ├── services/            Annotation, dataset and registry services
+│   │   └── workers/             Training, validation and export workers
+│   ├── backend/tests/
+│   └── Dockerfile.worker
 ├── frontend/
 │   ├── src/app/
 │   │   ├── dashboard/page.tsx
@@ -402,7 +489,8 @@ vehicle-traffic-platform/
 │   │   ├── watchlist/page.tsx
 │   │   ├── settings/page.tsx
 │   │   ├── health/page.tsx
-│   │   └── login/page.tsx
+│   │   ├── login/page.tsx
+│   │   └── training/             Datasets, annotation, jobs, registry and Gemini review
 │   ├── src/hooks/
 │   │   ├── useAuth.ts
 │   │   └── useWebSocket.ts
@@ -410,7 +498,10 @@ vehicle-traffic-platform/
 │   ├── src/types/index.ts
 │   └── Dockerfile
 ├── nginx/nginx.conf
-├── scripts/download_models.py
+├── scripts/
+│   ├── download_models.py
+│   └── start.sh
+├── start.cmd / start.ps1
 ├── docker-compose.yml
 ├── .env.example
 └── README.md

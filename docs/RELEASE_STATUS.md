@@ -1,6 +1,6 @@
 # Release readiness
 
-Updated: 2026-07-03.
+Updated: 2026-07-05.
 
 ## Verified in the current development environment
 
@@ -10,8 +10,11 @@ Updated: 2026-07-03.
 - Vehicle tracking, plate detection, temporal OCR voting, regional syntax validation, best-frame evidence selection, color voting and conservative vehicle-brand recognition are wired into the runtime pipeline.
 - The UI exposes four core AI presets, three experimental presets and a manual pipeline selector with compatibility warnings.
 - Camera and video recognition thresholds are source-local. Compute provider selection is global.
+- The separate Training API supports dataset annotation, deterministic splits, training jobs, validation, model registry approval and rollback.
+- Vehicle and plate instance-segmentation datasets, YOLO segmentation export and segmenter training paths are implemented.
+- Gemini-assisted capture is opt-in per source, stores only selected real frames, requires human review, and imports approved masks into segmentation datasets.
 - The interface supports Ukrainian and English.
-- Backend recognition tests and the Next.js production build pass in the Docker-backed development workflow.
+- Backend recognition tests, Training API integration tests, segmentation schema tests and the Next.js production build pass in the Docker-backed development workflow.
 
 ## Requires target data or deployment infrastructure
 
@@ -20,6 +23,8 @@ Updated: 2026-07-03.
 - Performance benchmarks for each preset on every supported CPU/GPU target. Local FPS figures must not be generalized to other hardware.
 - TensorRT engines built and validated on each target NVIDIA GPU and compatible TensorRT runtime.
 - Retention limits, backup/restore, monitoring, alert-delivery retries and production secret management.
+- A live Gemini provider request with a project-owned API key, plus cost/rate-limit and privacy-policy validation for the intended deployment jurisdiction.
+- Explicit integration and evaluation of approved segmenter artifacts in the live inference/tracking pipeline; registry approval alone does not switch tracking to masks.
 - A project-level license and a documented decision on third-party model and dataset licenses, including Ultralytics terms.
 
 ## Release classification

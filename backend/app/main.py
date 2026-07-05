@@ -14,10 +14,12 @@ from app.api.routers import (
     auth_router, cameras_router, videos_router, streams_router, tracks_router,
     events_router, watchlist_router, analytics_router,
     settings_router, health_router,
+    gemini_router,
 )
 from app.services.camera_manager import camera_manager
 from app.services.websocket_service import websocket_manager
 from app.services.event_service import EventService
+from app.services.gemini_training_service import gemini_training_service
 from app.utils.auth import hash_password, decode_token
 from app.schemas.schemas import AppSettingsSchema
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -80,6 +82,8 @@ async def lifespan(app: FastAPI):
     AsyncSessionForEvents = sessionmaker(
         engine_for_events, class_=AsyncSession, expire_on_commit=False
     )
+    gemini_training_service.set_session_factory(AsyncSessionForEvents)
+    camera_manager.set_frame_analysis_callback(gemini_training_service.consider_frame)
 
     event_service = EventService(
         db_session_factory=AsyncSessionForEvents,
@@ -99,6 +103,7 @@ async def lifespan(app: FastAPI):
     logger.info("🛑 Shutting down...")
     if event_service:
         await event_service.stop()
+    await gemini_training_service.shutdown()
     for stats in camera_manager.get_all_stats():
         await camera_manager.stop_camera(stats["camera_id"])
     if redis_client:
@@ -131,6 +136,7 @@ app.include_router(events_router)
 app.include_router(watchlist_router)
 app.include_router(analytics_router)
 app.include_router(settings_router)
+app.include_router(gemini_router)
 app.include_router(health_router)
 
 # Static files for crops/frames

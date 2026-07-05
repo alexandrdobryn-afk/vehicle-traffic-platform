@@ -8,7 +8,7 @@ from uuid import uuid4
 
 import aiofiles
 from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks, File, Form, UploadFile
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, and_, desc, delete
 from typing import Optional, List
@@ -18,13 +18,13 @@ import logging
 
 from app.models.database import (
     Camera, VehicleTrack, PlateCandidate, Event,
-    User, WatchlistEntry, AppSettings, get_db
+    User, WatchlistEntry, AppSettings, GeminiReviewCandidate, get_db
 )
 from app.schemas.schemas import (
     CameraCreate, CameraUpdate, CameraResponse,
     TrackResponse, EventResponse, WatchlistCreate, WatchlistResponse,
     AnalyticsSummaryResponse, LoginRequest, TokenResponse,
-    UserCreate, UserResponse, AppSettingsSchema,
+    UserCreate, UserResponse, AppSettingsSchema, GeminiSettingsUpdate, GeminiCandidateReview,
     AIMode, validate_camera_source_url, validate_pipeline_config,
 )
 from app.config import settings
@@ -35,6 +35,7 @@ from app.utils.auth import (
 )
 from app.services.camera_manager import camera_manager
 from app.services.video_capture_service import VideoCaptureService
+from app.services.gemini_training_service import gemini_training_service
 
 logger = logging.getLogger(__name__)
 
@@ -183,6 +184,11 @@ def _pipeline_runtime_settings(cam: Camera, global_settings: Optional[dict] = No
     runtime_settings["pipeline_config"] = config
     runtime_settings["save_crops"] = bool(cam.save_crops)
     runtime_settings["anonymization_mode"] = bool(cam.anonymization)
+    runtime_settings["gemini_enabled"] = bool(cam.gemini_enabled)
+    runtime_settings["gemini_verify_predictions"] = bool(cam.gemini_verify_predictions)
+    runtime_settings["gemini_collect_training"] = bool(cam.gemini_collect_training)
+    runtime_settings["gemini_sample_interval_seconds"] = int(cam.gemini_sample_interval_seconds or 30)
+    runtime_settings["gemini_max_candidates_per_run"] = int(cam.gemini_max_candidates_per_run or 25)
     global_settings = global_settings or defaults
     for key in RUNTIME_SETTING_KEYS:
         runtime_settings[key] = global_settings.get(key, defaults[key])
@@ -190,6 +196,17 @@ def _pipeline_runtime_settings(cam: Camera, global_settings: Optional[dict] = No
 
 
 async def _delete_source_records(cam: Camera, db: AsyncSession):
+    candidates = (await db.execute(
+        select(GeminiReviewCandidate).where(GeminiReviewCandidate.camera_id == cam.id)
+    )).scalars().all()
+    for candidate in candidates:
+        for stored_path in [candidate.frame_path, candidate.mask_path]:
+            if stored_path:
+                Path(stored_path).unlink(missing_ok=True)
+        for annotation in candidate.proposed_annotations or []:
+            if annotation.get("mask_path"):
+                Path(annotation["mask_path"]).unlink(missing_ok=True)
+    await db.execute(delete(GeminiReviewCandidate).where(GeminiReviewCandidate.camera_id == cam.id))
     track_ids = select(VehicleTrack.id).where(VehicleTrack.camera_id == cam.id)
     await db.execute(delete(PlateCandidate).where(PlateCandidate.vehicle_track_id.in_(track_ids)))
     await db.execute(delete(Event).where(Event.camera_id == cam.id))
@@ -249,6 +266,11 @@ async def upload_recorded_video(
     max_fps: int = Form(default=25),
     save_crops: bool = Form(default=True),
     anonymization: bool = Form(default=False),
+    gemini_enabled: bool = Form(default=False),
+    gemini_verify_predictions: bool = Form(default=True),
+    gemini_collect_training: bool = Form(default=True),
+    gemini_sample_interval_seconds: int = Form(default=30, ge=5, le=3600),
+    gemini_max_candidates_per_run: int = Form(default=25, ge=1, le=500),
     db: AsyncSession = Depends(get_db),
     user=Depends(require_operator),
 ):
@@ -315,6 +337,11 @@ async def upload_recorded_video(
             max_fps=max_fps,
             save_crops=save_crops,
             anonymization=anonymization,
+            gemini_enabled=gemini_enabled,
+            gemini_verify_predictions=gemini_verify_predictions,
+            gemini_collect_training=gemini_collect_training,
+            gemini_sample_interval_seconds=gemini_sample_interval_seconds,
+            gemini_max_candidates_per_run=gemini_max_candidates_per_run,
         )
         db.add(video)
         await db.commit()
@@ -353,6 +380,10 @@ async def start_recorded_video(
         video.is_active = False
         await db.commit()
         raise HTTPException(status_code=409, detail="Recorded video file is missing")
+    if video.gemini_enabled:
+        gemini_config = await gemini_training_service.get_public_settings()
+        if not gemini_config.get("configured") or not gemini_config.get("enabled"):
+            raise HTTPException(status_code=409, detail="Configure and enable Gemini API before starting this source")
 
     runtime_settings = _pipeline_runtime_settings(video, await _global_settings(db))
     success = await camera_manager.start_camera(
@@ -423,6 +454,11 @@ async def create_camera(
         max_fps=req.max_fps,
         save_crops=req.save_crops,
         anonymization=req.anonymization,
+        gemini_enabled=req.gemini_enabled,
+        gemini_verify_predictions=req.gemini_verify_predictions,
+        gemini_collect_training=req.gemini_collect_training,
+        gemini_sample_interval_seconds=req.gemini_sample_interval_seconds,
+        gemini_max_candidates_per_run=req.gemini_max_candidates_per_run,
     )
     db.add(cam)
     await db.commit()
@@ -516,6 +552,10 @@ async def test_camera(camera_id: int, db: AsyncSession = Depends(get_db), user=D
 async def start_camera(camera_id: int, db: AsyncSession = Depends(get_db), user=Depends(require_operator)):
     cam = await _get_camera_or_404(camera_id, db)
     url = _camera_source(cam)
+    if cam.gemini_enabled:
+        gemini_config = await gemini_training_service.get_public_settings()
+        if not gemini_config.get("configured") or not gemini_config.get("enabled"):
+            raise HTTPException(status_code=409, detail="Configure and enable Gemini API before starting this source")
     runtime_settings = _pipeline_runtime_settings(cam, await _global_settings(db))
     success = await camera_manager.start_camera(
         camera_id=camera_id,
@@ -894,6 +934,141 @@ async def runtime_status(db: AsyncSession = Depends(get_db), user=Depends(requir
         config["gpu_device_index"],
         config["runtime_fallback"],
     )
+
+
+@settings_router.get("/gemini")
+async def get_gemini_settings(user=Depends(require_viewer)):
+    return await gemini_training_service.get_public_settings()
+
+
+@settings_router.put("/gemini")
+async def update_gemini_settings(
+    req: GeminiSettingsUpdate,
+    user=Depends(require_admin),
+):
+    return await gemini_training_service.save_settings(req.model_dump(exclude_none=True))
+
+
+@settings_router.post("/gemini/test")
+async def test_gemini_settings(user=Depends(require_admin)):
+    result = await gemini_training_service.test_connection()
+    if not result.get("success"):
+        raise HTTPException(status_code=409, detail=result.get("error", "Gemini connection failed"))
+    return result
+
+
+# Gemini-assisted review queue. Candidate images stay behind normal API auth;
+# they are not exposed through a public browser URL.
+gemini_router = APIRouter(prefix="/api/v1/gemini", tags=["gemini-training"])
+
+
+def _candidate_response(candidate: GeminiReviewCandidate) -> dict:
+    return {
+        "id": candidate.id,
+        "camera_id": candidate.camera_id,
+        "processing_run_id": candidate.processing_run_id,
+        "track_id": candidate.track_id,
+        "status": candidate.status,
+        "selection_reason": candidate.selection_reason,
+        "frame_width": candidate.frame_width,
+        "frame_height": candidate.frame_height,
+        "target_model_type": candidate.target_model_type,
+        "local_predictions": candidate.local_predictions or [],
+        "gemini_verification": candidate.gemini_verification,
+        "proposed_annotations": candidate.proposed_annotations or [],
+        "provider_model": candidate.provider_model,
+        "usage_metadata": candidate.usage_metadata,
+        "error_message": candidate.error_message,
+        "reviewed_by": candidate.reviewed_by,
+        "reviewed_at": candidate.reviewed_at,
+        "created_at": candidate.created_at,
+        "image_url": f"/api/v1/gemini/candidates/{candidate.id}/image",
+        "mask_url": f"/api/v1/gemini/candidates/{candidate.id}/mask" if candidate.mask_path else None,
+    }
+
+
+@gemini_router.get("/candidates")
+async def list_gemini_candidates(
+    status: Optional[str] = None,
+    camera_id: Optional[int] = None,
+    limit: int = Query(default=100, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+    user=Depends(require_viewer),
+):
+    query = select(GeminiReviewCandidate)
+    if status:
+        query = query.where(GeminiReviewCandidate.status == status)
+    if camera_id is not None:
+        query = query.where(GeminiReviewCandidate.camera_id == camera_id)
+    result = await db.execute(query.order_by(GeminiReviewCandidate.created_at.desc()).limit(limit))
+    return [_candidate_response(candidate) for candidate in result.scalars().all()]
+
+
+@gemini_router.get("/candidates/{candidate_id}")
+async def get_gemini_candidate(
+    candidate_id: int,
+    db: AsyncSession = Depends(get_db),
+    user=Depends(require_viewer),
+):
+    candidate = await db.get(GeminiReviewCandidate, candidate_id)
+    if candidate is None:
+        raise HTTPException(status_code=404, detail="Gemini review candidate not found")
+    return _candidate_response(candidate)
+
+
+def _candidate_file(candidate: GeminiReviewCandidate, kind: str) -> FileResponse:
+    path = candidate.frame_path if kind == "image" else candidate.mask_path
+    if not path or not Path(path).is_file():
+        raise HTTPException(status_code=404, detail=f"Candidate {kind} is missing")
+    return FileResponse(path, media_type="image/jpeg" if kind == "image" else "image/png")
+
+
+@gemini_router.get("/candidates/{candidate_id}/image")
+async def get_gemini_candidate_image(
+    candidate_id: int,
+    db: AsyncSession = Depends(get_db),
+    user=Depends(require_viewer),
+):
+    candidate = await db.get(GeminiReviewCandidate, candidate_id)
+    if candidate is None:
+        raise HTTPException(status_code=404, detail="Gemini review candidate not found")
+    return _candidate_file(candidate, "image")
+
+
+@gemini_router.get("/candidates/{candidate_id}/mask")
+async def get_gemini_candidate_mask(
+    candidate_id: int,
+    db: AsyncSession = Depends(get_db),
+    user=Depends(require_viewer),
+):
+    candidate = await db.get(GeminiReviewCandidate, candidate_id)
+    if candidate is None:
+        raise HTTPException(status_code=404, detail="Gemini review candidate not found")
+    return _candidate_file(candidate, "mask")
+
+
+@gemini_router.patch("/candidates/{candidate_id}/review")
+async def review_gemini_candidate(
+    candidate_id: int,
+    req: GeminiCandidateReview,
+    user=Depends(require_operator),
+):
+    try:
+        candidate = await gemini_training_service.review_candidate(
+            candidate_id, req.model_dump(exclude_none=True), user["email"]
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return _candidate_response(candidate)
+
+
+@gemini_router.post("/candidates/{candidate_id}/retry")
+async def retry_gemini_candidate(candidate_id: int, user=Depends(require_operator)):
+    try:
+        await gemini_training_service.retry_candidate(candidate_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"message": "Candidate queued for Gemini retry"}
 
 
 @settings_router.patch("")

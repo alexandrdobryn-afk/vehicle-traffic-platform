@@ -24,6 +24,11 @@ export interface Camera {
   is_active: boolean
   save_crops: boolean
   anonymization: boolean
+  gemini_enabled: boolean
+  gemini_verify_predictions: boolean
+  gemini_collect_training: boolean
+  gemini_sample_interval_seconds: number
+  gemini_max_candidates_per_run: number
   created_at: string
   updated_at: string
 }
@@ -195,6 +200,50 @@ export interface AppSettings {
   minimum_plate_height: number
   save_crops: boolean
   anonymization_mode: boolean
+}
+
+export interface GeminiSettings {
+  configured: boolean
+  enabled: boolean
+  model: string
+  request_timeout_seconds: number
+  max_concurrent_requests: number
+  api_key_masked: string | null
+}
+
+export type GeminiCandidateStatus = 'processing' | 'ready' | 'approved' | 'rejected' | 'imported' | 'error'
+
+export interface GeminiAnnotation {
+  class_name: string
+  confidence: number
+  box_2d: [number, number, number, number]
+  polygon: number[][]
+  mask_path?: string
+  source: string
+  human_edited?: boolean
+}
+
+export interface GeminiCandidate {
+  id: number
+  camera_id: number
+  processing_run_id: string
+  track_id: number | null
+  status: GeminiCandidateStatus
+  selection_reason: string
+  frame_width: number
+  frame_height: number
+  target_model_type: string
+  local_predictions: Array<Record<string, unknown>>
+  gemini_verification: { local_predictions_correct: boolean; summary: string; confidence: number } | null
+  proposed_annotations: GeminiAnnotation[]
+  provider_model: string | null
+  usage_metadata: Record<string, unknown> | null
+  error_message: string | null
+  reviewed_by: string | null
+  reviewed_at: string | null
+  created_at: string
+  image_url: string
+  mask_url: string | null
 }
 
 export interface RuntimeStatus {

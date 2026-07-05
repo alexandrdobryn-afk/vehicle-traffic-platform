@@ -12,6 +12,8 @@ const TYPE_FILTERS: { value: string; label: string }[] = [
   { value: '', label: 'All Types' },
   { value: 'vehicle_detector', label: 'Vehicle Detector' },
   { value: 'plate_detector', label: 'Plate Detector' },
+  { value: 'vehicle_segmenter', label: 'Vehicle Segmenter' },
+  { value: 'plate_segmenter', label: 'Plate Segmenter' },
   { value: 'ocr', label: 'OCR' },
   { value: 'color_classifier', label: 'Color Classifier' },
 ]

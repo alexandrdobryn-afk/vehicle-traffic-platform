@@ -27,6 +27,7 @@ class CameraManager:
         self._redis = None
         self._lock = asyncio.Lock()
         self._source_finished_callback: Optional[Callable[[int, str], Awaitable[None]]] = None
+        self._frame_analysis_callback: Optional[Callable[..., Awaitable[None]]] = None
         self._preview_encode_counts: Dict[int, int] = {}
 
     def set_redis(self, redis_client):
@@ -34,6 +35,9 @@ class CameraManager:
 
     def set_source_finished_callback(self, callback: Callable[[int, str], Awaitable[None]]):
         self._source_finished_callback = callback
+
+    def set_frame_analysis_callback(self, callback: Callable[..., Awaitable[None]]):
+        self._frame_analysis_callback = callback
 
     async def start_camera(
         self,
@@ -171,6 +175,13 @@ class CameraManager:
                 )
 
                 if metadata:
+                    if self._frame_analysis_callback:
+                        await self._frame_analysis_callback(
+                            camera_id,
+                            source_frame,
+                            metadata,
+                            pipeline.runtime_settings,
+                        )
                     # Annotate frame
                     annotated = await asyncio.to_thread(
                         pipeline.draw_overlay, analysis_frame, metadata

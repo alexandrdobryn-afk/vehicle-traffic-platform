@@ -1,13 +1,14 @@
 import os
 import json
 import asyncio
+from pathlib import Path
 from typing import Optional, List
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query, BackgroundTasks
 from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, desc, update
+from sqlalchemy import select, desc, update, text
 
 from app.models.database import (
     Dataset, DatasetImage, DatasetVideo, Annotation,
@@ -19,8 +20,9 @@ from app.schemas.schemas import (
     DatasetSplitConfig, AnnotationCreate, AnnotationResponse,
     TrainingJobCreate, TrainingJobResponse, TrainingMetricsResponse,
     ModelVersionResponse, DeployApproval, RollbackRequest,
-    VideoExtractConfig, AutoAnnotateConfig,
+    VideoExtractConfig, AutoAnnotateConfig, GeminiCandidateImport,
 )
+from app.config import settings
 from app.services.dataset_service import dataset_service
 from app.services.annotation_service import annotation_service
 from app.services.model_registry_service import model_registry_service
@@ -50,6 +52,116 @@ async def create_dataset(
     user=Depends(require_operator),
 ):
     return await dataset_service.create_dataset(db, data, user["email"])
+
+
+@datasets_router.post("/import-gemini")
+async def import_gemini_candidates(
+    data: GeminiCandidateImport,
+    db: AsyncSession = Depends(get_db),
+    user=Depends(require_operator),
+):
+    """Import human-approved real frames and segmentation masks into Training."""
+    model_type = data.target_model_type.value
+    if not model_type.endswith("_segmenter"):
+        raise HTTPException(400, "Gemini mask candidates require a segmenter dataset")
+
+    dataset = await dataset_service.get_dataset(db, data.dataset_id) if data.dataset_id else None
+    if data.dataset_id and dataset is None:
+        raise HTTPException(404, "Dataset not found")
+    if dataset is None:
+        if not data.dataset_name:
+            raise HTTPException(422, "dataset_name is required when dataset_id is omitted")
+        from app.schemas.schemas import DatasetCreate, AnnotationTypeEnum, ModelTypeEnum
+        dataset = await dataset_service.create_dataset(
+            db,
+            DatasetCreate(
+                name=data.dataset_name,
+                description="Human-approved Gemini-assisted masks from real platform frames",
+                model_type=ModelTypeEnum(model_type),
+                annotation_type=AnnotationTypeEnum.SEGMENTATION,
+                classes=["car", "truck", "bus", "motorcycle", "van"] if model_type == "vehicle_segmenter" else ["license_plate"],
+                tags=["gemini-assisted", "human-verified", "real-frames"],
+            ),
+            user["email"],
+        )
+    if dataset.model_type != model_type or dataset.annotation_type != "segmentation":
+        raise HTTPException(400, "Target dataset is not compatible with the selected segmenter")
+
+    query = text("""
+        SELECT id, frame_path, frame_width, frame_height, proposed_annotations,
+               provider_model, processing_run_id, camera_id, track_id
+        FROM gemini_review_candidates
+        WHERE id = ANY(:ids) AND status = 'approved' AND target_model_type != 'verification_only'
+        ORDER BY id
+    """)
+    rows = (await db.execute(query, {"ids": data.candidate_ids})).mappings().all()
+    imported = 0
+    annotations_created = 0
+    allowed_classes = set(dataset.classes or [])
+    source_root = Path(settings.SOURCE_STORAGE_PATH)
+
+    for row in rows:
+        source_path = Path(row["frame_path"])
+        try:
+            relative = source_path.relative_to("/app/storage")
+        except ValueError:
+            raise HTTPException(409, f"Candidate {row['id']} has an unmanaged source path")
+        mounted_path = source_root / relative
+        if not mounted_path.is_file():
+            raise HTTPException(409, f"Candidate frame {row['id']} is not available to Training API")
+        image = await dataset_service.save_uploaded_image(
+            db, dataset.id, f"gemini_candidate_{row['id']}{mounted_path.suffix or '.jpg'}", mounted_path.read_bytes()
+        )
+        proposed = row["proposed_annotations"] or []
+        for annotation in proposed:
+            class_name = annotation.get("class_name")
+            polygon = annotation.get("polygon") or []
+            if class_name not in allowed_classes or len(polygon) < 3:
+                continue
+            xs = [float(point[0]) for point in polygon]
+            ys = [float(point[1]) for point in polygon]
+            x0, x1 = max(0.0, min(xs)), min(1.0, max(xs))
+            y0, y1 = max(0.0, min(ys)), min(1.0, max(ys))
+            ann = Annotation(
+                image_id=image.id,
+                annotation_type="segmentation",
+                class_name=class_name,
+                class_id=list(dataset.classes).index(class_name),
+                x_center=(x0 + x1) / 2,
+                y_center=(y0 + y1) / 2,
+                bbox_width=x1 - x0,
+                bbox_height=y1 - y0,
+                polygon=polygon,
+                confidence=annotation.get("confidence"),
+                is_auto=True,
+                is_verified=True,
+                provenance={
+                    "source": "gemini_review_candidate",
+                    "candidate_id": row["id"],
+                    "provider_model": row["provider_model"],
+                    "camera_id": row["camera_id"],
+                    "processing_run_id": row["processing_run_id"],
+                    "track_id": row["track_id"],
+                    "reviewed_by": user["email"],
+                },
+            )
+            db.add(ann)
+            annotations_created += 1
+        image.is_annotated = True
+        imported += 1
+
+    await db.execute(
+        update(Dataset)
+        .where(Dataset.id == dataset.id)
+        .values(annotation_count=Dataset.annotation_count + annotations_created)
+    )
+    await db.commit()
+    return {
+        "dataset_id": dataset.id,
+        "imported_candidates": imported,
+        "annotations_created": annotations_created,
+        "skipped_candidates": len(data.candidate_ids) - imported,
+    }
 
 
 @datasets_router.get("/{dataset_id}", response_model=DatasetResponse)
@@ -344,6 +456,8 @@ async def create_job(
     allowed_architectures = {
         "vehicle_detector": {"yolo11n", "yolo11s", "yolo11m", "yolov8n", "yolov8s"},
         "plate_detector": {"yolo11n", "yolov8n"},
+        "vehicle_segmenter": {"yolo11n-seg", "yolo11s-seg"},
+        "plate_segmenter": {"yolo11n-seg"},
         "color_classifier": {"mobilenetv3", "efficientnet", "resnet18"},
         "ocr": {"lprnet"},
     }
@@ -570,6 +684,13 @@ ARCHITECTURES = {
     "plate_detector": [
         {"id": "yolo11n", "name": "YOLO11 Nano", "desc": "Recommended for plates", "params": "2.6M"},
         {"id": "yolov8n", "name": "YOLOv8 Nano", "desc": "Stable plate detector", "params": "3.2M"},
+    ],
+    "vehicle_segmenter": [
+        {"id": "yolo11n-seg", "name": "YOLO11 Nano Seg", "desc": "Fast instance segmentation baseline", "params": "2.9M"},
+        {"id": "yolo11s-seg", "name": "YOLO11 Small Seg", "desc": "Balanced mask quality", "params": "10.1M"},
+    ],
+    "plate_segmenter": [
+        {"id": "yolo11n-seg", "name": "YOLO11 Nano Seg", "desc": "Precise plate contours", "params": "2.9M"},
     ],
     "color_classifier": [
         {"id": "mobilenetv3", "name": "MobileNetV3 Small", "desc": "Fast, edge-friendly", "params": "2.5M"},

@@ -1,5 +1,5 @@
-export type ModelType = 'vehicle_detector' | 'plate_detector' | 'ocr' | 'color_classifier'
-export type AnnotationType = 'bbox' | 'classification' | 'ocr'
+export type ModelType = 'vehicle_detector' | 'plate_detector' | 'vehicle_segmenter' | 'plate_segmenter' | 'ocr' | 'color_classifier'
+export type AnnotationType = 'bbox' | 'segmentation' | 'classification' | 'ocr'
 export type JobStatus = 'queued' | 'preparing' | 'training' | 'validation' | 'export' | 'completed' | 'failed' | 'cancelled'
 export type DeployStatus = 'pending' | 'approved' | 'deployed' | 'rejected' | 'rolled_back'
 
@@ -44,6 +44,9 @@ export interface TAnnotation {
   y_center: number | null
   bbox_width: number | null
   bbox_height: number | null
+  polygon: number[][] | null
+  mask_path: string | null
+  provenance: Record<string, unknown> | null
   ocr_text: string | null
   label: string | null
   confidence: number | null
@@ -150,6 +153,8 @@ export interface TrainingProgress {
 export const MODEL_TYPE_LABELS: Record<ModelType, string> = {
   vehicle_detector: 'Vehicle Detector',
   plate_detector: 'Plate Detector',
+  vehicle_segmenter: 'Vehicle Segmenter',
+  plate_segmenter: 'Plate Segmenter',
   ocr: 'OCR',
   color_classifier: 'Color Classifier',
 }

@@ -33,6 +33,11 @@ const EMPTY_FORM = {
   priority: 1,
   save_crops: true,
   anonymization: false,
+  gemini_enabled: false,
+  gemini_verify_predictions: true,
+  gemini_collect_training: true,
+  gemini_sample_interval_seconds: 30,
+  gemini_max_candidates_per_run: 25,
 }
 
 const MANUAL_OPTIONS = {
@@ -374,6 +379,18 @@ export default function VideosPage() {
                 <div className="flex gap-4">
                   <label className="flex items-center gap-2 text-sm text-muted-foreground"><input type="checkbox" checked={form.save_crops} onChange={(e) => setForm({ ...form, save_crops: e.target.checked })} />{t('Save crops')}</label>
                   <label className="flex items-center gap-2 text-sm text-muted-foreground"><input type="checkbox" checked={form.anonymization} onChange={(e) => setForm({ ...form, anonymization: e.target.checked })} />{t('Anonymize plates/faces')}</label>
+                </div>
+                <div className="rounded-xl border border-violet-500/25 bg-violet-500/5 p-4 space-y-3">
+                  <label className="flex items-start gap-2"><input type="checkbox" checked={form.gemini_enabled} onChange={(e) => setForm({ ...form, gemini_enabled: e.target.checked })} className="mt-1" /><span><span className="block text-sm font-medium text-foreground">{t('Use selected frames to improve models with Gemini')}</span><span className="block text-xs text-muted-foreground mt-1">{t('Only bounded representative frames are uploaded. The full video stays local.')}</span></span></label>
+                  {form.gemini_enabled && <div className="pl-6 space-y-3">
+                    <label className="flex items-center gap-2 text-sm text-muted-foreground"><input type="checkbox" checked={form.gemini_verify_predictions} onChange={(e) => setForm({ ...form, gemini_verify_predictions: e.target.checked })} />{t('Verify model detections with Gemini')}</label>
+                    <label className="flex items-center gap-2 text-sm text-muted-foreground"><input type="checkbox" checked={form.gemini_collect_training} onChange={(e) => setForm({ ...form, gemini_collect_training: e.target.checked })} />{t('Create mask candidates for training')}</label>
+                    <div className="grid grid-cols-2 gap-3">
+                      <label className="text-xs text-muted-foreground">{t('Minimum interval, seconds')}<input type="number" min={5} max={3600} value={form.gemini_sample_interval_seconds} onChange={(e) => setForm({ ...form, gemini_sample_interval_seconds: Number(e.target.value) })} className="mt-1 w-full px-3 py-2 bg-background border border-input rounded-lg text-sm" /></label>
+                      <label className="text-xs text-muted-foreground">{t('Maximum candidates per run')}<input type="number" min={1} max={500} value={form.gemini_max_candidates_per_run} onChange={(e) => setForm({ ...form, gemini_max_candidates_per_run: Number(e.target.value) })} className="mt-1 w-full px-3 py-2 bg-background border border-input rounded-lg text-sm" /></label>
+                    </div>
+                    <p className="text-xs text-amber-400">{t('Frames may contain license plates or people. Enable this only when external processing is permitted.')}</p>
+                  </div>}
                 </div>
                 {uploading && <div><div className="flex justify-between text-xs text-muted-foreground mb-1"><span>{t('Uploading...')}</span><span>{uploadProgress}%</span></div><div className="h-2 bg-muted rounded-full overflow-hidden"><div className="h-full bg-primary transition-all" style={{ width: `${uploadProgress}%` }} /></div></div>}
               </div>

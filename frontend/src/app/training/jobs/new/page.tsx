@@ -9,7 +9,7 @@ import { ChevronRight, ChevronLeft } from 'lucide-react'
 import { useTranslation } from '@/lib/i18n'
 
 const STEPS = ['Model & Dataset', 'Architecture', 'Hyperparameters', 'Augmentation', 'Review']
-const MODEL_TYPES: ModelType[] = ['vehicle_detector', 'plate_detector', 'color_classifier', 'ocr']
+const MODEL_TYPES: ModelType[] = ['vehicle_detector', 'plate_detector', 'vehicle_segmenter', 'plate_segmenter', 'color_classifier', 'ocr']
 const OPTIMIZERS = ['SGD', 'Adam', 'AdamW']
 const SCHEDULERS = ['cosine', 'linear', 'step', 'none']
 

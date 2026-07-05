@@ -7,12 +7,15 @@ from enum import Enum
 class ModelTypeEnum(str, Enum):
     VEHICLE_DETECTOR = "vehicle_detector"
     PLATE_DETECTOR = "plate_detector"
+    VEHICLE_SEGMENTER = "vehicle_segmenter"
+    PLATE_SEGMENTER = "plate_segmenter"
     OCR = "ocr"
     COLOR_CLASSIFIER = "color_classifier"
 
 
 class AnnotationTypeEnum(str, Enum):
     BBOX = "bbox"
+    SEGMENTATION = "segmentation"
     CLASSIFICATION = "classification"
     OCR = "ocr"
 
@@ -109,6 +112,9 @@ class AnnotationCreate(BaseModel):
     y_center: Optional[float] = Field(None, ge=0, le=1)
     bbox_width: Optional[float] = Field(None, ge=0, le=1)
     bbox_height: Optional[float] = Field(None, ge=0, le=1)
+    polygon: Optional[List[List[float]]] = None
+    mask_path: Optional[str] = None
+    provenance: Optional[Dict[str, Any]] = None
     # OCR
     ocr_text: Optional[str] = None
     # Classification
@@ -128,6 +134,9 @@ class AnnotationResponse(BaseModel):
     y_center: Optional[float]
     bbox_width: Optional[float]
     bbox_height: Optional[float]
+    polygon: Optional[List[List[float]]]
+    mask_path: Optional[str]
+    provenance: Optional[Dict[str, Any]]
     ocr_text: Optional[str]
     label: Optional[str]
     confidence: Optional[float]
@@ -137,6 +146,13 @@ class AnnotationResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class GeminiCandidateImport(BaseModel):
+    candidate_ids: List[int] = Field(..., min_length=1, max_length=500)
+    dataset_id: Optional[int] = None
+    dataset_name: Optional[str] = Field(default=None, min_length=1, max_length=255)
+    target_model_type: ModelTypeEnum = ModelTypeEnum.VEHICLE_SEGMENTER
 
 
 # ─── Augmentation ─────────────────────────────────────────────────
