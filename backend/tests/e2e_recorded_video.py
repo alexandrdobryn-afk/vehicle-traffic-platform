@@ -1,4 +1,4 @@
-"""Docker-backed smoke test for the recorded-video API and finite-source lifecycle."""
+﻿"""Docker-backed smoke test for the recorded-video API and finite-source lifecycle."""
 
 import os
 import tempfile
@@ -10,9 +10,9 @@ import httpx
 import numpy as np
 
 
-BASE_URL = os.getenv("VTP_E2E_BASE_URL", "http://127.0.0.1:8000/api/v1")
-EMAIL = os.getenv("VTP_E2E_EMAIL", "admin@vtp.local")
-PASSWORD = os.getenv("VTP_E2E_PASSWORD", "admin123")
+BASE_URL = os.getenv("BEVP_E2E_BASE_URL", "http://127.0.0.1:8000/api/v1")
+EMAIL = os.getenv("BEVP_E2E_EMAIL", "admin@bevp.local")
+PASSWORD = os.getenv("BEVP_E2E_PASSWORD", "admin123")
 
 
 def make_video(path: Path, seconds: int = 2, fps: int = 10):
@@ -47,7 +47,7 @@ def main():
         path = Path(temp_dir) / "recorded-video-smoke.avi"
         make_video(path)
 
-        if os.getenv("VTP_E2E_LOCAL_AUTH") == "1":
+        if os.getenv("BEVP_E2E_LOCAL_AUTH") == "1":
             from app.utils.auth import create_access_token
             token = create_access_token({"sub": "1", "role": "admin", "email": EMAIL})
         else:

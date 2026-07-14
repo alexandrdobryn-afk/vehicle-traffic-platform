@@ -23,8 +23,6 @@ opencv-python-headless==4.9.0.80
 numpy==1.26.4
 onnxruntime==1.18.0
 ultralytics==8.4.81
-easyocr==1.7.1
-pytesseract==0.3.13
 
 # Cryptography
 cryptography==42.0.7

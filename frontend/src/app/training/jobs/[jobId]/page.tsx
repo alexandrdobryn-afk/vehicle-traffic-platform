@@ -75,8 +75,6 @@ export default function JobDetailPage() {
     if (match) return t('Epoch {current}/{total} — accuracy: {accuracy}', { current: match[1], total: match[2], accuracy: match[3] })
     match = message.match(/^Epoch (\d+)\/(\d+) — mAP50: (.+)$/)
     if (match) return t('Epoch {current}/{total} — mAP50: {value}', { current: match[1], total: match[2], value: match[3] })
-    match = message.match(/^LPRNet epoch (\d+)\/(\d+) — plate accuracy: (.+)$/)
-    if (match) return t('LPRNet epoch {current}/{total} — plate accuracy: {accuracy}', { current: match[1], total: match[2], accuracy: match[3] })
     return t(message)
   }
 

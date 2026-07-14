@@ -1,98 +1,52 @@
-#!/usr/bin/env python3
-"""
-Export YOLO models to TensorRT .engine for maximum GPU inference speed.
-Run this on the target GPU machine before deploying.
+"""Export approved drone-vision YOLO artifacts to TensorRT engines."""
 
-Requirements:
-- NVIDIA GPU with CUDA
-- TensorRT 8.x or 10.x
-- Ultralytics >= 8.2
+from __future__ import annotations
 
-Usage:
-    python export_tensorrt.py --model yolo11n --half
-    python export_tensorrt.py --model yolov8n_plate --input backend/models/plate_detector/yolov8n_plate.pt
-"""
 import argparse
-import os
-import sys
+from pathlib import Path
 
 
-def export_vehicle_detector(size: str = "n", half: bool = True):
+ROOT = Path(__file__).resolve().parents[1]
+MODELS_DIR = ROOT / "backend" / "models"
+
+
+def export_yolo_artifact(weights: Path, half: bool = True) -> Path:
+    if not weights.exists():
+        raise FileNotFoundError(weights)
+    import torch
+    if not torch.cuda.is_available():
+        raise RuntimeError("TensorRT export requires a CUDA-capable NVIDIA GPU")
     from ultralytics import YOLO
-    models_dir = os.path.join(os.path.dirname(__file__), "..", "backend", "models", "vehicle_detector")
-    pt_path = os.path.join(models_dir, f"yolo11{size}.pt")
 
-    if not os.path.exists(pt_path):
-        print(f"Downloading yolo11{size}.pt...")
-        model = YOLO(f"yolo11{size}.pt")
-    else:
-        model = YOLO(pt_path)
+    model = YOLO(str(weights))
+    model.export(format="engine", half=half, device=0)
+    engine_path = weights.with_suffix(".engine")
+    if not engine_path.exists():
+        raise RuntimeError(f"TensorRT export did not produce {engine_path}")
+    return engine_path
 
-    print(f"Exporting yolo11{size} to TensorRT (half={half})...")
-    engine_path = model.export(
-        format="engine",
-        half=half,
-        device=0,
-        workspace=4,   # GB
-        simplify=True,
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--role",
+        choices=["object_detector", "object_segmenter"],
+        default="object_detector",
     )
-    dest = os.path.join(models_dir, f"yolo11{size}.engine")
-    if engine_path != dest:
-        import shutil
-        shutil.copy(engine_path, dest)
-    print(f"✅ Saved: {dest}")
+    parser.add_argument(
+        "--weights",
+        default="production.pt",
+        help="Artifact filename inside backend/models/<role> or an absolute path",
+    )
+    parser.add_argument("--fp32", action="store_true", help="Disable FP16 export")
+    args = parser.parse_args()
 
-
-def export_plate_detector(pt_path: str, half: bool = True):
-    from ultralytics import YOLO
-    if not os.path.exists(pt_path):
-        print(f"❌ Not found: {pt_path}")
-        return
-
-    model = YOLO(pt_path)
-    print(f"Exporting plate detector to TensorRT...")
-    engine_path = model.export(format="engine", half=half, device=0, workspace=2, simplify=True)
-    dest = pt_path.replace(".pt", ".engine")
-    if engine_path != dest:
-        import shutil
-        shutil.copy(engine_path, dest)
-    print(f"✅ Saved: {dest}")
-
-
-def check_gpu():
-    try:
-        import torch
-        if not torch.cuda.is_available():
-            print("❌ No CUDA GPU detected. TensorRT export requires NVIDIA GPU.")
-            sys.exit(1)
-        print(f"✅ GPU: {torch.cuda.get_device_name(0)}")
-        print(f"   CUDA: {torch.version.cuda}")
-        print(f"   VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
-    except ImportError:
-        print("❌ PyTorch not installed")
-        sys.exit(1)
+    requested = Path(args.weights)
+    weights = requested if requested.is_absolute() else MODELS_DIR / args.role / requested
+    engine = export_yolo_artifact(weights, half=not args.fp32)
+    print(f"Exported TensorRT engine: {engine}")
+    return 0
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Export YOLO models to TensorRT")
-    parser.add_argument("--target", choices=["vehicle", "plate", "all"], default="all")
-    parser.add_argument("--size", choices=["n", "s", "m"], default="n", help="YOLO size for vehicle detector")
-    parser.add_argument("--plate_pt", default="backend/models/plate_detector/yolov8n_plate.pt")
-    parser.add_argument("--half", action="store_true", default=True, help="FP16 precision")
-    parser.add_argument("--full_precision", action="store_true", help="Use FP32 instead of FP16")
-    args = parser.parse_args()
-
-    check_gpu()
-    half = not args.full_precision
-
-    if args.target in ("vehicle", "all"):
-        export_vehicle_detector(size=args.size, half=half)
-
-    if args.target in ("plate", "all"):
-        plate_path = os.path.abspath(args.plate_pt)
-        if os.path.exists(plate_path):
-            export_plate_detector(plate_path, half=half)
-        else:
-            print(f"⚠️  Plate detector not found at {plate_path}, skipping")
-
-    print("\n✅ Export complete. Restart the platform to use TensorRT models.")
+    raise SystemExit(main())

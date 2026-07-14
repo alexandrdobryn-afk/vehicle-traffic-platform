@@ -26,8 +26,10 @@ from sqlalchemy.orm import configure_mappers, sessionmaker
 from app.config import settings
 from app.main import app
 from app.models.database import (
+    ActiveLearningItem,
     Dataset,
     DeployLog,
+    EvaluationReport,
     ModelVersion,
     TrainingJob,
 )
@@ -136,8 +138,8 @@ class TrainingApiIntegrationTest(TestCase):
             models = []
             for number in (1, 2):
                 model = ModelVersion(
-                    name=f"integration_plate_model_{suffix}_{number}",
-                    model_type="plate_detector",
+                    name=f"integration_object_model_{suffix}_{number}",
+                    model_type="object_detector",
                     architecture="yolov8n",
                     version=f"v{number}.0",
                     version_number=number,
@@ -149,6 +151,8 @@ class TrainingApiIntegrationTest(TestCase):
                     artifact_metadata={"source": "integration_test"},
                     deploy_status="pending",
                     validation_passed=True,
+                    gate_result="approved",
+                    gate_reasons=["integration gate passed"],
                     auto_test_results={"passed": True},
                     author_email="training-integration@local",
                 )
@@ -173,6 +177,9 @@ class TrainingApiIntegrationTest(TestCase):
             for endpoint in ("datasets", "jobs", "registry"):
                 response = client.get(f"/api/v1/training/{endpoint}", headers=headers)
                 self.assertEqual(response.status_code, 200, response.text)
+            for endpoint in ("active-learning", "evaluation/reports"):
+                response = client.get(f"/api/v1/training/{endpoint}", headers=headers)
+                self.assertEqual(response.status_code, 200, response.text)
 
             created = client.post(
                 "/api/v1/training/datasets",
@@ -180,9 +187,9 @@ class TrainingApiIntegrationTest(TestCase):
                 json={
                     "name": f"integration-{suffix}",
                     "description": "Small lifecycle dataset; not a quality benchmark",
-                    "model_type": "plate_detector",
+                    "model_type": "object_detector",
                     "annotation_type": "bbox",
-                    "classes": ["license_plate"],
+                    "classes": ["target_object"],
                     "tags": ["integration-test"],
                 },
             )
@@ -217,7 +224,7 @@ class TrainingApiIntegrationTest(TestCase):
                     headers=headers,
                     json={
                         "annotation_type": "bbox",
-                        "class_name": "license_plate",
+                        "class_name": "target_object",
                         "class_id": 0,
                         "x_center": 0.5,
                         "y_center": 0.5,
@@ -235,12 +242,19 @@ class TrainingApiIntegrationTest(TestCase):
             self.assertEqual(split.status_code, 200, split.text)
             self.assertEqual(sum(split.json()["counts"].values()), 4)
 
+            frozen = client.post(
+                f"/api/v1/training/datasets/{self.dataset_id}/freeze",
+                headers=headers,
+            )
+            self.assertEqual(frozen.status_code, 200, frozen.text)
+            self.assertTrue(frozen.json()["is_frozen"])
+
             mismatch = client.post(
                 "/api/v1/training/jobs",
                 headers=headers,
                 json={
                     "name": f"mismatch-{suffix}",
-                    "model_type": "vehicle_detector",
+                    "model_type": "object_classifier",
                     "architecture": "yolo11n",
                     "dataset_id": self.dataset_id,
                 },
@@ -252,7 +266,7 @@ class TrainingApiIntegrationTest(TestCase):
                 headers=headers,
                 json={
                     "name": f"invalid-arch-{suffix}",
-                    "model_type": "plate_detector",
+                    "model_type": "object_detector",
                     "architecture": "not-a-model",
                     "dataset_id": self.dataset_id,
                 },
@@ -265,8 +279,8 @@ class TrainingApiIntegrationTest(TestCase):
                     "/api/v1/training/jobs",
                     headers=headers,
                     json={
-                        "name": f"plate-smoke-{suffix}",
-                        "model_type": "plate_detector",
+                        "name": f"object-smoke-{suffix}",
+                        "model_type": "object_detector",
                         "architecture": "yolov8n",
                         "dataset_id": self.dataset_id,
                         "hyperparams": {"epochs": 1, "batch_size": 1, "workers": 0},
@@ -317,6 +331,31 @@ class TrainingApiIntegrationTest(TestCase):
             )
             self.assertEqual(rejected.status_code, 200, rejected.text)
             self.assertTrue(rejected.json()["success"])
+
+            with SyncSession() as db:
+                report = EvaluationReport(
+                    model_version_id=self.model_ids[0],
+                    dataset_id=self.dataset_id,
+                    job_id=self.job_id,
+                    summary={"map50": 0.7},
+                    gate_result="approved",
+                    gate_reasons=["integration report"],
+                )
+                db.add(report)
+                db.flush()
+                db.add(ActiveLearningItem(
+                    dataset_id=self.dataset_id,
+                    image_id=images[0]["id"],
+                    reason="low_confidence",
+                    priority_score=40,
+                    source="integration_test",
+                ))
+                db.commit()
+
+            reports = client.get("/api/v1/training/evaluation/reports", headers=headers)
+            self.assertEqual(reports.status_code, 200, reports.text)
+            active_learning = client.get("/api/v1/training/active-learning", headers=headers)
+            self.assertEqual(active_learning.status_code, 200, active_learning.text)
 
             with SyncSession() as db:
                 stored = db.get(Dataset, self.dataset_id)

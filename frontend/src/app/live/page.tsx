@@ -2,10 +2,9 @@
 import { useEffect, useState } from 'react'
 import AppShell from '@/components/shared/AppShell'
 import api from '@/lib/api'
-import { Camera, WSFrame, COLOR_HEX } from '@/types'
+import { Camera, WSFrame } from '@/types'
 import { useWebSocket } from '@/hooks/useWebSocket'
 import { useStreamUrl } from '@/hooks/useStreamUrl'
-import { CheckCircle } from 'lucide-react'
 import { useTranslation } from '@/lib/i18n'
 
 function CameraFeed({ camera }: { camera: Camera }) {
@@ -44,10 +43,10 @@ function CameraFeed({ camera }: { camera: Camera }) {
           </div>
         )}
 
-        {/* Vehicle count overlay */}
+        {/* Object count overlay */}
         {frame && frame.objects.length > 0 && (
           <div className="absolute bottom-2 left-2 bg-black/70 rounded-md px-2 py-1">
-            <p className="text-xs text-green-400 font-mono">{t('{count} vehicles', { count: frame.objects.length })}</p>
+            <p className="text-xs text-green-400 font-mono">{t('{count} objects', { count: frame.objects.length })}</p>
           </div>
         )}
       </div>
@@ -58,20 +57,10 @@ function CameraFeed({ camera }: { camera: Camera }) {
           {frame.objects.map((obj) => (
             <div key={obj.track_id} className="flex items-center justify-between text-xs px-1">
               <div className="flex items-center gap-1.5">
-                <span className="w-2 h-2 rounded-full" style={{ backgroundColor: COLOR_HEX[obj.color] || '#6b7280' }} />
                 <span className="font-mono font-bold text-foreground">#{obj.track_id}</span>
-                <span className="text-muted-foreground">{t(obj.vehicle_class)}</span>
+                <span className="text-muted-foreground">{t(obj.object_class || 'object')}</span>
               </div>
-              <div className="flex items-center gap-1">
-                {obj.plate ? (
-                  <>
-                    <span className="plate-badge bg-primary/10 text-primary">{obj.plate}</span>
-                    {obj.plate_status === 'verified' && <CheckCircle className="w-3 h-3 text-emerald-400" />}
-                  </>
-                ) : (
-                  <span className="text-muted-foreground italic">{t('searching...')}</span>
-                )}
-              </div>
+              <span className="text-muted-foreground">{Math.round((obj.detection_confidence ?? 0) * 100)}%</span>
             </div>
           ))}
         </div>

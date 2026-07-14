@@ -54,7 +54,7 @@ class WebSocketManager:
                     self._connections[camera_id] -= dead
 
     async def broadcast_alert(self, alert_data: dict):
-        """Broadcast watchlist alert to ALL connected clients."""
+        """Broadcast a source-level alert to all connected clients."""
         message = json.dumps({"type": "alert", **alert_data}, default=str)
         for cam_id, clients in list(self._connections.items()):
             dead = set()

@@ -1,23 +1,19 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 from enum import Enum
 
 
 class ModelTypeEnum(str, Enum):
-    VEHICLE_DETECTOR = "vehicle_detector"
-    PLATE_DETECTOR = "plate_detector"
-    VEHICLE_SEGMENTER = "vehicle_segmenter"
-    PLATE_SEGMENTER = "plate_segmenter"
-    OCR = "ocr"
-    COLOR_CLASSIFIER = "color_classifier"
+    OBJECT_DETECTOR = "object_detector"
+    OBJECT_SEGMENTER = "object_segmenter"
+    OBJECT_CLASSIFIER = "object_classifier"
 
 
 class AnnotationTypeEnum(str, Enum):
     BBOX = "bbox"
     SEGMENTATION = "segmentation"
     CLASSIFICATION = "classification"
-    OCR = "ocr"
 
 
 class JobStatusEnum(str, Enum):
@@ -33,10 +29,47 @@ class JobStatusEnum(str, Enum):
 
 class DeployStatusEnum(str, Enum):
     PENDING = "pending"
+    CANDIDATE = "candidate"
     APPROVED = "approved"
     DEPLOYED = "deployed"
     REJECTED = "rejected"
     ROLLED_BACK = "rolled_back"
+
+
+class FrameStatusEnum(str, Enum):
+    UNLABELED = "unlabeled"
+    AUTO_LABELED = "auto_labeled"
+    NEEDS_REVIEW = "needs_review"
+    REVIEWED = "reviewed"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    HARD_NEGATIVE = "hard_negative"
+    TRAINING_READY = "training_ready"
+
+
+class TrainingModeEnum(str, Enum):
+    BASELINE_INFERENCE = "baseline_inference"
+    HEAD_FINETUNE = "head_finetune"
+    FULL_FINETUNE = "full_finetune"
+    TILED_TRAINING = "tiled_training"
+    HARD_NEGATIVE_TRAINING = "hard_negative_training"
+    SEMI_SUPERVISED = "semi_supervised"
+    CONTINUAL_RETRAINING = "continual_retraining"
+
+
+class ActiveLearningStatusEnum(str, Enum):
+    OPEN = "open"
+    IN_REVIEW = "in_review"
+    ANNOTATED = "annotated"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    SKIPPED = "skipped"
+
+
+class GateResultEnum(str, Enum):
+    APPROVED = "approved"
+    CANDIDATE = "candidate"
+    REJECTED = "rejected"
 
 
 # ─── Dataset ──────────────────────────────────────────────────────
@@ -66,6 +99,11 @@ class DatasetResponse(BaseModel):
     classes: List[str]
     status: str
     version: str
+    parent_dataset_id: Optional[int] = None
+    content_hash: Optional[str] = None
+    is_frozen: bool = False
+    frozen_at: Optional[datetime] = None
+    lineage: dict = Field(default_factory=dict)
     image_count: int
     video_count: int
     annotation_count: int
@@ -88,6 +126,12 @@ class DatasetImageResponse(BaseModel):
     source: str
     split: Optional[str]
     is_annotated: bool
+    frame_status: str = "unlabeled"
+    review_priority: float = 0.0
+    review_reason: Optional[str] = None
+    scene_tags: List[str] = Field(default_factory=list)
+    quality_tags: List[str] = Field(default_factory=list)
+    frame_metadata: Dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
 
     class Config:
@@ -95,9 +139,9 @@ class DatasetImageResponse(BaseModel):
 
 
 class DatasetSplitConfig(BaseModel):
-    train_ratio: float = Field(default=0.7, ge=0.1, le=0.9)
+    train_ratio: float = Field(default=0.8, ge=0.1, le=0.9)
     val_ratio: float = Field(default=0.2, ge=0.05, le=0.5)
-    test_ratio: float = Field(default=0.1, ge=0.0, le=0.3)
+    test_ratio: float = Field(default=0.0, ge=0.0, le=0.3)
     seed: int = 42
 
 
@@ -152,7 +196,7 @@ class GeminiCandidateImport(BaseModel):
     candidate_ids: List[int] = Field(..., min_length=1, max_length=500)
     dataset_id: Optional[int] = None
     dataset_name: Optional[str] = Field(default=None, min_length=1, max_length=255)
-    target_model_type: ModelTypeEnum = ModelTypeEnum.VEHICLE_SEGMENTER
+    target_model_type: ModelTypeEnum = ModelTypeEnum.OBJECT_SEGMENTER
 
 
 # ─── Augmentation ─────────────────────────────────────────────────
@@ -193,15 +237,45 @@ class HyperParams(BaseModel):
     half: bool = False
 
 
+class TileTrainingConfig(BaseModel):
+    enabled: bool = False
+    tile_size: int = Field(default=1024, ge=320, le=4096)
+    overlap: float = Field(default=0.2, ge=0.0, le=0.75)
+    include_empty_tiles: bool = True
+    max_empty_tile_ratio: float = Field(default=0.25, ge=0.0, le=1.0)
+    min_bbox_area: float = Field(default=0.00001, ge=0.0, le=1.0)
+    min_visibility: float = Field(default=0.2, ge=0.0, le=1.0)
+
+
+class EvaluationPolicy(BaseModel):
+    auto_validate_after_training: bool = True
+    min_ap_small_delta: float = Field(default=0.05, ge=-1.0, le=1.0)
+    max_recall_small_drop: float = Field(default=0.0, ge=-1.0, le=1.0)
+    max_fp_per_frame_increase_ratio: float = Field(default=0.10, ge=0.0, le=10.0)
+    max_old_holdout_drop: float = Field(default=0.02, ge=0.0, le=1.0)
+    min_fps: float = Field(default=0.0, ge=0.0)
+    max_latency_p95_ms: Optional[float] = Field(default=None, ge=1.0)
+    min_recall_small: float = Field(default=0.0, ge=0.0, le=1.0)
+    max_fp_per_frame: Optional[float] = Field(default=None, ge=0.0)
+    small_object_area_threshold: float = Field(default=0.01, ge=0.0, le=1.0)
+    error_iou_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
+    error_confidence_threshold: float = Field(default=0.25, ge=0.0, le=1.0)
+    max_error_items: int = Field(default=300, ge=0, le=5000)
+
+
 # ─── Training Job ─────────────────────────────────────────────────
 
 class TrainingJobCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=255)
     model_type: ModelTypeEnum
     architecture: str                   # yolo11n, yolo11s, mobilenetv3, etc.
+    base_model_id: Optional[str] = Field(default=None, max_length=255)
     dataset_id: int
+    training_mode: TrainingModeEnum = TrainingModeEnum.FULL_FINETUNE
     hyperparams: HyperParams = HyperParams()
     augmentation: AugmentationConfig = AugmentationConfig()
+    tile_config: TileTrainingConfig = TileTrainingConfig()
+    evaluation_policy: EvaluationPolicy = EvaluationPolicy()
     description: Optional[str] = None
 
 
@@ -213,7 +287,11 @@ class TrainingJobResponse(BaseModel):
     dataset_id: int
     status: str
     celery_task_id: Optional[str]
+    training_mode: str = "full_finetune"
     hyperparams: Optional[Dict[str, Any]]
+    base_model: Optional[Dict[str, Any]] = None
+    tile_config: Dict[str, Any] = Field(default_factory=dict)
+    evaluation_policy: Dict[str, Any] = Field(default_factory=dict)
     current_epoch: int
     total_epochs: int
     progress_pct: float
@@ -230,6 +308,11 @@ class TrainingJobResponse(BaseModel):
     class Config:
         from_attributes = True
 
+    @model_validator(mode="after")
+    def populate_base_model(self):
+        self.base_model = (self.hyperparams or {}).get("base_model")
+        return self
+
 
 class TrainingMetricsResponse(BaseModel):
     id: int
@@ -243,7 +326,7 @@ class TrainingMetricsResponse(BaseModel):
     map50_95: Optional[float]
     accuracy: Optional[float]
     char_accuracy: Optional[float]
-    plate_accuracy: Optional[float]
+    text_accuracy: Optional[float]
     gpu_memory_mb: Optional[float]
     gpu_utilization: Optional[float]
     lr: Optional[float]
@@ -289,6 +372,9 @@ class ModelVersionResponse(BaseModel):
     validation_passed: Optional[bool]
     auto_test_results: Optional[Dict[str, Any]]
     benchmark_vs_prev: Optional[Dict[str, Any]]
+    gate_result: Optional[str] = None
+    gate_reasons: List[str] = Field(default_factory=list)
+    evaluation_report_id: Optional[int] = None
     author_email: Optional[str]
     approved_by: Optional[str]
     deployed_at: Optional[datetime]
@@ -328,6 +414,12 @@ class TrainingProgressWS(BaseModel):
 class VideoExtractConfig(BaseModel):
     fps: float = Field(default=1.0, ge=0.1, le=30.0,
                        description="Frames per second to extract")
+    interval_seconds: Optional[float] = Field(
+        default=None,
+        ge=0.25,
+        le=3600.0,
+        description="Extract one frame every N seconds. Overrides fps when set.",
+    )
     max_frames: Optional[int] = Field(None, ge=1, le=10000)
     start_time: float = Field(default=0.0, ge=0)
     end_time: Optional[float] = None
@@ -341,3 +433,81 @@ class AutoAnnotateConfig(BaseModel):
     confidence_threshold: float = Field(default=0.5, ge=0.1, le=1.0)
     image_ids: Optional[List[int]] = None     # None = all un-annotated
     overwrite_existing: bool = False
+
+
+class FrameStatusUpdate(BaseModel):
+    status: FrameStatusEnum
+    review_reason: Optional[str] = Field(default=None, max_length=100)
+    review_priority: Optional[float] = Field(default=None, ge=0, le=100)
+    scene_tags: Optional[List[str]] = None
+    quality_tags: Optional[List[str]] = None
+
+
+class ActiveLearningCreate(BaseModel):
+    dataset_id: int
+    image_id: int
+    reason: str = Field(..., min_length=1, max_length=80)
+    priority_score: float = Field(default=10.0, ge=0, le=100)
+    suggested_class: Optional[str] = Field(default=None, max_length=100)
+    source: str = Field(default="manual", max_length=80)
+    model_version_id: Optional[int] = None
+    evaluation_error_id: Optional[int] = None
+    details: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ActiveLearningStatusUpdate(BaseModel):
+    status: ActiveLearningStatusEnum
+
+
+class ActiveLearningItemResponse(BaseModel):
+    id: int
+    dataset_id: int
+    image_id: int
+    model_version_id: Optional[int]
+    evaluation_error_id: Optional[int]
+    reason: str
+    priority_score: float
+    status: str
+    suggested_class: Optional[str]
+    source: str
+    details: Dict[str, Any] = Field(default_factory=dict)
+    reviewer_email: Optional[str]
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class EvaluationReportResponse(BaseModel):
+    id: int
+    model_version_id: int
+    dataset_id: Optional[int]
+    job_id: Optional[int]
+    summary: Dict[str, Any]
+    per_class_metrics: Dict[str, Any]
+    slice_metrics: Dict[str, Any]
+    speed_metrics: Dict[str, Any]
+    confusion_matrix: Optional[Any]
+    gate_result: str
+    gate_reasons: List[str] = Field(default_factory=list)
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class EvaluationErrorResponse(BaseModel):
+    id: int
+    report_id: int
+    dataset_image_id: Optional[int]
+    error_type: str
+    class_name: Optional[str]
+    confidence: Optional[float]
+    priority_score: float
+    bbox: Optional[Any]
+    details: Dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+
+    class Config:
+        from_attributes = True

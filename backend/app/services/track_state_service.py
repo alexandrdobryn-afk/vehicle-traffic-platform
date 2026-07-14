@@ -4,6 +4,7 @@ from typing import Dict, Optional, List, Any, Tuple
 from dataclasses import dataclass, field, asdict, is_dataclass
 from datetime import datetime
 import logging
+import math
 
 logger = logging.getLogger(__name__)
 
@@ -12,30 +13,28 @@ logger = logging.getLogger(__name__)
 class ActiveTrack:
     track_id: int
     camera_id: int
-    vehicle_class: str
+    object_class: str
     bbox: List[int]
-    color: str = "unknown"
-    color_confidence: float = 0.0
-    color_history: List = field(default_factory=list)
-    vehicle_make: str = "unknown"
-    make_confidence: float = 0.0
-    brand_history: List = field(default_factory=list)
     class_history: List = field(default_factory=list)
-    plate: Optional[str] = None
-    plate_status: str = "searching"
-    plate_confidence: float = 0.0
-    ocr_candidates: List = field(default_factory=list)
     first_seen: str = ""
     last_seen: str = ""
     frame_count: int = 0
     db_track_id: Optional[int] = None  # PostgreSQL row id
-    best_vehicle_crop_path: Optional[str] = None
-    best_plate_crop_path: Optional[str] = None
+    best_crop_path: Optional[str] = None
     best_detection_conf: float = 0.0
-    best_vehicle_crop_score: float = 0.0
-    best_plate_crop_score: float = 0.0
+    best_crop_score: float = 0.0
     processing_run_id: str = ""
-    recognition_diagnostics: Dict[str, Any] = field(default_factory=dict)
+    diagnostics: Dict[str, Any] = field(default_factory=dict)
+    trajectory: List[List[float]] = field(default_factory=list)
+    speed_pixels_per_second: float = 0.0
+    direction_degrees: Optional[float] = None
+    state: str = "active"
+    attributes: Dict[str, Any] = field(default_factory=dict)
+    first_video_timestamp_seconds: Optional[float] = None
+    last_video_timestamp_seconds: Optional[float] = None
+    predicted: bool = False
+    motion_vector: List[float] = field(default_factory=list)
+    events_fired: Dict[str, bool] = field(default_factory=dict)
 
     @property
     def duration_seconds(self) -> float:
@@ -50,29 +49,28 @@ class ActiveTrack:
         return {
             "track_id": self.track_id,
             "camera_id": self.camera_id,
-            "vehicle_class": self.vehicle_class,
+            "object_class": self.object_class,
             "detection_confidence": round(self.best_detection_conf, 3),
             "bbox": self.bbox,
-            "color": self.color,
-            "color_confidence": self.color_confidence,
-            "vehicle_make": self.vehicle_make,
-            "make_confidence": self.make_confidence,
-            "plate": self.plate,
-            "plate_status": self.plate_status,
-            "plate_confidence": self.plate_confidence,
             "first_seen": self.first_seen,
             "last_seen": self.last_seen,
             "frame_count": self.frame_count,
             "db_track_id": self.db_track_id,
             "duration_seconds": self.duration_seconds,
-            "best_vehicle_crop_path": self.best_vehicle_crop_path,
-            "best_plate_crop_path": self.best_plate_crop_path,
+            "best_crop_path": self.best_crop_path,
             "processing_run_id": self.processing_run_id,
-            "recognition_diagnostics": self.recognition_diagnostics,
-            "ocr_candidates": [
-                asdict(candidate) if is_dataclass(candidate) else candidate
-                for candidate in self.ocr_candidates
-            ],
+            "diagnostics": self.diagnostics,
+            "trajectory": self.trajectory,
+            "speed_pixels_per_second": round(self.speed_pixels_per_second, 3),
+            "direction_degrees": self.direction_degrees,
+            "state": self.state,
+            "attributes": self.attributes,
+            "last_bbox": self.bbox,
+            "first_video_timestamp_seconds": self.first_video_timestamp_seconds,
+            "last_video_timestamp_seconds": self.last_video_timestamp_seconds,
+            "predicted": self.predicted,
+            "motion_vector": self.motion_vector,
+            "events_fired": self.events_fired,
         }
 
     def to_ws_dict(self) -> dict:
@@ -80,21 +78,21 @@ class ActiveTrack:
         return {
             "track_id": self.track_id,
             "bbox": self.bbox,
-            "vehicle_class": self.vehicle_class,
-            "plate": self.plate,
-            "plate_status": self.plate_status,
-            "plate_confidence": round(self.plate_confidence, 3),
-            "color": self.color,
-            "color_confidence": round(self.color_confidence, 3),
-            "vehicle_make": self.vehicle_make,
-            "make_confidence": round(self.make_confidence, 3),
-            "recognition_diagnostics": self.recognition_diagnostics,
+            "object_class": self.object_class,
+            "detection_confidence": round(self.best_detection_conf, 3),
+            "trajectory": self.trajectory[-30:],
+            "speed_pixels_per_second": round(self.speed_pixels_per_second, 3),
+            "direction_degrees": self.direction_degrees,
+            "state": self.state,
+            "attributes": self.attributes,
+            "predicted": self.predicted,
+            "motion_vector": self.motion_vector,
         }
 
 
 class TrackStateService:
     """
-    Manages active vehicle tracks in memory + Redis.
+    Manages active object tracks in memory + Redis.
     Coordinates between pipeline and database writes.
     """
 
@@ -126,10 +124,13 @@ class TrackStateService:
     async def upsert_track(
         self,
         track_id: int,
-        vehicle_class: str,
+        object_class: str,
         bbox: List[int],
         detection_conf: float,
         now: str,
+        predicted: bool = False,
+        motion_vector: Optional[List[float]] = None,
+        video_timestamp_seconds: Optional[float] = None,
     ) -> Tuple[ActiveTrack, bool]:
         """
         Insert or update a track. Returns (track, is_new).
@@ -141,95 +142,90 @@ class TrackStateService:
                 track = ActiveTrack(
                     track_id=track_id,
                     camera_id=self.camera_id,
-                    vehicle_class=vehicle_class,
+                    object_class=object_class,
                     bbox=bbox,
                     first_seen=now,
                     last_seen=now,
                     best_detection_conf=detection_conf,
                     processing_run_id=self.processing_run_id,
+                    first_video_timestamp_seconds=video_timestamp_seconds,
+                    last_video_timestamp_seconds=video_timestamp_seconds,
                 )
                 self._tracks[track_id] = track
             else:
                 track = self._tracks[track_id]
+                previous_bbox = track.bbox
+                previous_time = track.last_seen
                 track.bbox = bbox
-                track.last_seen = now
-                if detection_conf > track.best_detection_conf:
+                if not predicted:
+                    track.last_seen = now
+                try:
+                    elapsed = (
+                        datetime.fromisoformat(now.replace("Z", "+00:00"))
+                        - datetime.fromisoformat(previous_time.replace("Z", "+00:00"))
+                    ).total_seconds()
+                    if elapsed > 0:
+                        old_center = ((previous_bbox[0] + previous_bbox[2]) / 2, (previous_bbox[1] + previous_bbox[3]) / 2)
+                        new_center = ((bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2)
+                        dx, dy = new_center[0] - old_center[0], new_center[1] - old_center[1]
+                        track.speed_pixels_per_second = math.hypot(dx, dy) / elapsed
+                        if dx or dy:
+                            track.direction_degrees = round((math.degrees(math.atan2(dy, dx)) + 360) % 360, 2)
+                except (TypeError, ValueError):
+                    pass
+                if not predicted and detection_conf > track.best_detection_conf:
                     track.best_detection_conf = detection_conf
+                if video_timestamp_seconds is not None:
+                    track.last_video_timestamp_seconds = video_timestamp_seconds
 
-            track.class_history.append((vehicle_class, float(detection_conf)))
+            track.predicted = predicted
+            track.motion_vector = list(motion_vector or [])
+            track.state = "predicted" if predicted else "active"
+
+            center = [round((bbox[0] + bbox[2]) / 2, 2), round((bbox[1] + bbox[3]) / 2, 2)]
+            track.trajectory.append(center)
+            if len(track.trajectory) > 300:
+                track.trajectory = track.trajectory[-300:]
+
+            if not predicted:
+                track.class_history.append((object_class, float(detection_conf)))
             if len(track.class_history) > 15:
                 track.class_history = track.class_history[-15:]
             class_scores: Dict[str, float] = {}
             for observed_class, observed_confidence in track.class_history:
                 class_scores[observed_class] = class_scores.get(observed_class, 0.0) + observed_confidence
-            track.vehicle_class = max(class_scores, key=class_scores.get)
+            track.object_class = max(class_scores, key=class_scores.get)
 
-            track.frame_count += 1
+            if not predicted:
+                track.frame_count += 1
             self._missing_frames[track_id] = 0
             return track, is_new
 
-    async def update_color(
-        self,
-        track_id: int,
-        color: str,
-        confidence: float,
-        color_history: list,
-    ):
+    async def update_attributes(self, track_id: int, **attributes: Any):
         async with self._lock:
             if track_id in self._tracks:
-                t = self._tracks[track_id]
-                t.color = color
-                t.color_confidence = confidence
-                t.color_history = color_history
+                self._tracks[track_id].attributes.update(attributes)
 
-    async def update_brand(
-        self,
-        track_id: int,
-        vehicle_make: str,
-        confidence: float,
-        brand_history: list,
-    ):
+    async def mark_event_fired(self, track_id: int, event_type: str):
         async with self._lock:
             if track_id in self._tracks:
-                track = self._tracks[track_id]
-                track.vehicle_make = vehicle_make
-                track.make_confidence = confidence
-                track.brand_history = brand_history
-
-    async def update_plate(
-        self,
-        track_id: int,
-        plate: Optional[str],
-        plate_status: str,
-        plate_confidence: float,
-        ocr_candidates: list,
-    ):
-        async with self._lock:
-            if track_id in self._tracks:
-                t = self._tracks[track_id]
-                t.plate = plate
-                t.plate_status = plate_status
-                t.plate_confidence = plate_confidence
-                t.ocr_candidates = ocr_candidates
+                self._tracks[track_id].events_fired[event_type] = True
 
     async def update_diagnostics(self, track_id: int, **diagnostics: Any):
         async with self._lock:
             if track_id in self._tracks:
-                self._tracks[track_id].recognition_diagnostics.update(diagnostics)
+                self._tracks[track_id].diagnostics.update(diagnostics)
 
     async def update_crops(
         self,
         track_id: int,
-        vehicle_crop_path: Optional[str] = None,
-        plate_crop_path: Optional[str] = None,
+        crop_path: Optional[str] = None,
     ):
         async with self._lock:
             if track_id in self._tracks:
                 t = self._tracks[track_id]
-                if vehicle_crop_path:
-                    t.best_vehicle_crop_path = vehicle_crop_path
-                if plate_crop_path:
-                    t.best_plate_crop_path = plate_crop_path
+                if crop_path:
+                    t.best_crop_path = crop_path
 
     async def set_db_id(self, track_id: int, db_id: int):
         async with self._lock:
@@ -255,7 +251,9 @@ class TrackStateService:
                 if self._missing_frames.get(tid, 0) > self.max_missing_frames
             ]
             for tid in stale:
-                removed.append(self._tracks.pop(tid))
+                track = self._tracks.pop(tid)
+                track.state = "lost"
+                removed.append(track)
                 self._missing_frames.pop(tid, None)
         return removed
 
@@ -263,6 +261,8 @@ class TrackStateService:
         """Atomically remove and return every active track at a finite source EOF."""
         async with self._lock:
             removed = list(self._tracks.values())
+            for track in removed:
+                track.state = "completed"
             self._tracks.clear()
             self._missing_frames.clear()
             return removed

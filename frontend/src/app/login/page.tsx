@@ -37,8 +37,8 @@ export default function LoginPage() {
           <div className="inline-flex items-center justify-center w-16 h-16 rounded-2xl bg-primary/10 mb-4">
             <Shield className="w-8 h-8 text-primary" />
           </div>
-          <h1 className="text-2xl font-bold text-foreground">{t('Vehicle Traffic Platform')}</h1>
-          <p className="text-muted-foreground mt-1">{t('AI-powered traffic analysis')}</p>
+          <h1 className="text-2xl font-bold text-foreground">{t("Bird's-Eye Vision Platform")}</h1>
+          <p className="text-muted-foreground mt-1">{t('Modular aerial computer vision')}</p>
         </div>
 
         {/* Card */}

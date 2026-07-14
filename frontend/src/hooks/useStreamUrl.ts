@@ -2,9 +2,7 @@
 
 import { useEffect, useState } from 'react'
 
-import api from '@/lib/api'
-
-const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
+import api, { API_URL } from '@/lib/api'
 
 export function useStreamUrl(
   sourceId: number | null,

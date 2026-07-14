@@ -1,508 +1,144 @@
-# 🚗 Vehicle Traffic Platform
+# Bird's-Eye Vision Platform
 
-Professional AI-powered vehicle traffic analysis platform with real-time detection, license plate recognition, color classification, and a modern web dashboard.
+BEVP is a Computer Vision platform for detecting, classifying, segmenting and tracking small objects in aerial video. It accepts recorded drone footage and live camera streams, preserves high-resolution detail through tiled inference and supports the full dataset → annotation → training → deployment workflow.
 
----
+This repository is the aerial-analysis product. The previous road-monitoring application is a separate project and is not a runtime profile of BEVP.
 
-## 📋 Overview
+## What is implemented
 
-| Feature | Details |
+| Area | Capability |
 |---|---|
-| Vehicle Detection | YOLO11 / YOLO26; optional RF-DETR |
-| Tracking | ByteTrack / BoT-SORT with identity stitching |
-| Plate Detection | YOLOv8 / YOLO11 / OpenImageModels ONNX |
-| Plate OCR | PaddleOCR / EasyOCR / FastPlateOCR / optional LPRNet + temporal voting |
-| Best Evidence | Track-level best vehicle and plate crop selection |
-| Color & Brand | HSV/KMeans fallback, optional classifiers, multi-frame voting |
-| Regex Validation | UA / EU / US plate formats |
-| Sources | RTSP, HLS, MJPEG, JPEG snapshots and uploaded video |
-| Video Transport | MJPEG preview + WebSocket metadata |
-| Auth | JWT, role-based (admin/operator/viewer) |
-| Alerts | Frontend / Webhook / Telegram |
-| AI Modes | Four core presets, three experimental presets, and manual pipeline selection |
-| Compute Runtime | Automatic / CPU / NVIDIA CUDA, FP32 quality policy |
-| Training Platform | Dataset lifecycle, annotation, train/validation/test splits, jobs, validation, model registry and rollback |
-| Segmentation Training | YOLO11 instance segmentation for vehicles and license plates |
-| Gemini Assistance | Opt-in detection review and human-approved mask collection from selected real frames |
-| Storage | PostgreSQL + Redis + local crops, datasets and model artifacts |
+| Sources | Video files, drone streams, RTSP, HLS, MJPEG, JPEG snapshots and USB cameras |
+| Detection | YOLO, RT-DETR and RF-DETR adapters behind one object-detector interface |
+| Small objects | Source-resolution inference, overlapping tiles, global NMS and optional enhancement |
+| Tracking | ByteTrack, BoT-SORT, OC-SORT, DeepSORT and StrongSORT-compatible adapters with stable IDs and trajectories |
+| Prediction | Separate constant-velocity Kalman module for smoothing and short detection gaps |
+| Classification | Optional project-trained ONNX object classifier |
+| Segmentation | Optional project-trained instance-segmentation model with polygon output |
+| Training | Aerial object detection, classification and segmentation datasets/jobs |
+| Review loop | Frame statuses, manual review actions, hard-negative capture and active-learning queue |
+| Evaluation | Validation reports, generated FP/FN/class-confusion error items, model comparison fields and decision gate metadata |
+| Runtime | Python/OpenCV/PyTorch/ONNX, optional CUDA and a C++ ONNX reference runtime |
+| UI | Dashboard, cameras, videos, live view, events, analytics, settings and training |
 
----
+## Normal workflow
 
-## 🏗 Architecture
+1. Open **Cameras** to connect a drone/live source, or **Videos** to upload a recorded flight.
+2. Choose **Speed**, **Balanced**, **Quality** or **Manual**.
+3. Configure the source-local detection threshold, target classes, tile size and overlap.
+4. Enable or disable Kalman prediction, object classification and instance segmentation.
+5. Start processing and inspect live tracks, events and analytics.
+6. For custom classes, run baseline inference, review predictions, freeze a dataset version, train a model, validate it, inspect the decision gate and promote only an approved artifact into `backend/models/object_detector`, `object_classifier` or `object_segmenter`.
+7. Use **Active Learning** to move low-confidence, missed, rejected and hard-negative frames into the next dataset version.
 
-```
-RTSP Camera
-    ↓
-VideoCaptureService  (separate thread, auto-reconnect)
-    ↓
-FrameQualityFilter   (blur, brightness, contrast check)
-    ↓
-VehicleDetectionService  (YOLO11 / YOLO26 / RF-DETR when installed)
-    ↓
-TrackingService      (ByteTrack / OC-SORT / BoT-SORT)
-    ↓
-PlateDetectionService → OCRService → Temporal Voting
-    ↓
-ColorRecognitionService → Multi-frame Voting
-    ↓
-TrackStateService    (in-memory + Redis TTL)
-    ↓
-EventService         (async queue → PostgreSQL)
-    ↓
-WebSocket            (metadata only)
-MJPEG stream         (annotated video)
-    ↓
-Next.js Dashboard
-```
+Training jobs expose the same knobs used by the backend: full fine-tune, head-only, frozen-backbone, tiled training and baseline inference; tile size, overlap, object visibility and empty-tile ratio; small-object recall gates, FP/frame limits, latency limits and validation-error thresholds. These settings are stored with the job and used by the worker instead of being UI-only labels.
 
-Optional training-data path:
+The default source profile is `aerial_small_objects` with Balanced mode, 1024-pixel tiles, 20% overlap, Kalman prediction enabled, classification enabled when its model exists, and segmentation disabled until explicitly requested.
+
+## Model directories
 
 ```text
-Selected real track frame → Gemini verification + instance masks
-    → authenticated review queue → human approval
-    → segmentation dataset → explicit split → Training Job
-    → validation → manual registry approval/deployment
-```
-
----
-
-## 🛠 Tech Stack
-
-**Inference backend:** Python 3.11, FastAPI, OpenCV, PyTorch, Ultralytics YOLO11, PaddleOCR, EasyOCR, ByteTrack, SQLAlchemy, PostgreSQL, Redis, JWT
-
-**Training backend:** FastAPI, Celery, Redis, PyTorch/Ultralytics, dataset annotation and model registry services
-
-**Frontend:** Next.js 15, React 18, TypeScript, Tailwind CSS, Recharts, WebSocket
-
-**Infrastructure:** Docker Compose, Nginx, Fernet encryption
-
----
-
-## ⚡ Quick Start
-
-### Prerequisites
-
-- Docker + Docker Compose
-- NVIDIA GPU (optional but recommended)
-- NVIDIA Container Toolkit (for GPU support)
-
-### 1. Clone and configure
-
-```bash
-git clone https://github.com/alexandrdobryn-afk/vehicle-traffic-platform.git
-cd vehicle-traffic-platform
-cp .env.example .env
-```
-
-Edit `.env`:
-```env
-SECRET_KEY=your-super-secret-key-min-32-chars
-FERNET_KEY=  # Optional; derived stably from SECRET_KEY when empty
-```
-
-Generate Fernet key:
-```bash
-python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
-# Add output to FERNET_KEY= in .env
-```
-
-### 2. Download base models
-
-```bash
-python scripts/download_models.py all
-python scripts/download_models.py --verify-only
-python scripts/download_models.py --write-lock  # Explicitly regenerate provenance after manifest changes
-```
-
-### 3. Start platform
-
-```bash
-# Recommended Windows/WSL launch (automatically selects NVIDIA CUDA or CPU)
-.\start.cmd
-
-# PowerShell equivalent
-.\start.ps1
-
-# Rebuild images when dependencies or Dockerfiles changed
-.\start.ps1 -Build
-
-# Explicit CPU launch
-.\start.ps1 -Cpu
-
-# Production profile with Nginx
-.\start.ps1 -Profile production
-
-# Linux/WSL equivalent
-bash scripts/start.sh
-```
-
-### 4. Access
-
-| Service | URL |
-|---|---|
-| Dashboard | http://localhost:3000 |
-| Inference API docs | http://localhost:8000/docs |
-| Training API docs | http://localhost:8001/docs |
-| Inference health | http://localhost:8000/api/v1/health |
-| Training health | http://localhost:8001/api/v1/training/health |
-
-Development credentials come from `INITIAL_ADMIN_EMAIL` and `INITIAL_ADMIN_PASSWORD` in `.env`. Production rejects the example password and secret.
-
----
-
-## 📷 Adding a Camera
-
-1. Open Dashboard → Cameras
-2. Click **Add Camera**
-3. Select RTSP, HLS, MJPEG or JPEG snapshot and enter the source URL
-4. Select AI Mode (Balanced recommended)
-5. Optionally enable Gemini verification/training capture; only selected frames are sent
-6. Click **Save** → **Start**
-
-The system auto-restarts cameras on platform restart.
-
----
-
-## 🤖 AI Modes
-
-The registry resolves every preset against models that are actually installed. The UI shows the effective detector, tracker, plate detector and OCR engine; preset names are not guarantees that an unavailable model loaded successfully.
-
-| Mode | Preferred Pipeline | Use Case |
-|---|---|---|
-| **Speed** | Lightweight detector + ByteTrack + fast OCR fallback | Throughput and edge baseline |
-| **Balanced** | YOLO production path + ByteTrack + temporal OCR | Default production starting point |
-| **Quality** | Best installed detector + BoT-SORT + full OCR | Difficult footage and forensic review |
-| **Hybrid** | Balanced first pass + optional RF-DETR re-check | Variable traffic and uncertain scenes |
-| **Practical NextGen** | YOLO26 + TrackTrack target + PaddleOCR | Experimental A/B testing |
-| **Maximum Accuracy** | RF-DETR target + TrackTrack + PaddleOCR | Heavy experimental comparison |
-| **ONNX Edge** | ONNX/TensorRT target + ByteTrack + FastPlateOCR | Edge and optimized-runtime testing |
-
-### Hardware Requirements
-
-| Runtime | Requirement | Notes |
-|---|---|---|
-| CPU | Any supported x86-64 installation | Compatible but slower for multi-camera inference |
-| NVIDIA CUDA | NVIDIA GPU, driver and Container Toolkit | Recommended; verified by the runtime status screen |
-| TensorRT | Engine built for the target GPU and compatible TensorRT runtime | Provider availability alone does not mean an engine exists |
-
----
-
-## 🧠 Models
-
-### Directory Structure
-
-```
 backend/models/
-├── vehicle_detector/
-│   ├── yolo11n.pt / yolo11s.pt
-│   ├── yolo26n.pt / yolo26s.pt
-│   └── rf-detr-nano.pth / rf-detr-medium.pth
-├── plate_detector/
-│   ├── yolov8n_plate.pt
-│   ├── yolo11n_plate.pt
-│   └── openimagemodels_yolov9t_384.onnx
-├── brand_classifier/      ← optional local artifact
-├── color_classifier/      ← optional local artifact
-└── ocr/                   ← optional local artifact
+  object_detector/
+    production.pt
+    yolo11n.pt
+    yolo11s.pt
+    rf-detr-nano.pth
+    rf-detr-medium.pth
+    rtdetr-l.pt
+  object_classifier/
+    production.onnx
+    labels.json
+  object_segmenter/
+    production.pt
 ```
 
-Model binaries are intentionally excluded from Git. Their URLs, revisions, licenses and checksums are recorded in `backend/models/manifest.json` and `manifest.lock.json`.
+BEVP does not silently substitute an unrelated model. If an optional or manually selected artifact is missing, the API reports it as unavailable.
 
-### Getting Plate Detector
+## Start on Windows
 
-**Download the approved prototype model pack:**
-```bash
-python scripts/download_models.py all
-python scripts/download_models.py --verify-only
-python scripts/download_models.py --write-lock  # Explicitly regenerate provenance after manifest changes
+Requirements: WSL2, Docker Engine inside the selected WSL distribution, a current Windows NVIDIA driver with WSL CUDA support, and NVIDIA Container Toolkit in WSL.
+
+Normal NVIDIA launch:
+
+```powershell
+Set-Location "C:\Users\Admin\Desktop\CV drone\drone-vision-platform"; .\start.cmd -Build -Foreground
 ```
 
-**Option 2 — Train your own (recommended for production):**
-```bash
-# 1. Collect plate images and annotate with CVAT / Roboflow
-# 2. Train:
-python -c "
-from ultralytics import YOLO
-model = YOLO('yolov8n.pt')
-model.train(data='plate_dataset.yaml', epochs=100, imgsz=640)
-"
-# 3. Export:
-model.export(format='engine', half=True, device=0)
+The launcher treats CUDA as required by default. It selects the GPU compose overlay only when Docker reports the NVIDIA runtime, then verifies that Docker attached NVIDIA `DeviceRequests` to the backend. Heavy CUDA smoke probes are opt-in because a wedged WSL/Docker GPU runtime can hang container creation itself. If WSL/Docker appears wedged, normal startup stops with a diagnostic and leaves WSL recovery to the explicit repair command.
+
+GPU access is intentionally limited to compute services: the inference backend and training worker. The training API is a control plane and the frontend can start even if the training subsystem is degraded.
+
+Strict CUDA container validation, for diagnostics only:
+
+```powershell
+.\start.cmd -Build -Foreground -VerifyCudaContainers
 ```
 
-### Getting Color Classifier
+Explicit CPU emergency launch:
 
-**Option 1 — HSV fallback (no model needed):**
-The system automatically uses HSV+KMeans if no ONNX model is found. This is a heuristic fallback; measure it on the client holdout set.
-
-**Option 2 — Train MobileNetV3:**
-```bash
-# Datasets: UFPR-VCR, Vehicle Color Recognition Dataset
-# Use AI Training in the dashboard for dataset, job and registry management
-python scripts/train_color_classifier.py
+```powershell
+Set-Location "C:\Users\Admin\Desktop\CV drone\drone-vision-platform"; .\start.cmd -Cpu -Build -Foreground
 ```
 
-### Exporting to TensorRT (for GPU speedup)
+The launcher defaults to foreground mode. Keep that terminal open while testing. In this Windows + WSL setup, detached `docker compose up -d` can appear healthy and then be stopped when the WSL session is torn down. Use `-Detached` only when WSL is known to stay alive independently.
 
-```python
-from ultralytics import YOLO
-model = YOLO("backend/models/vehicle_detector/yolo11n.pt")
-model.export(format="engine", half=True, device=0)
-# Build on the deployment GPU. TensorRT engines are machine-specific.
+If WSL returns `Wsl/EnumerateDistros/Service/E_ACCESSDENIED`, or if CUDA disappears after reboot, run from Administrator PowerShell:
+
+```powershell
+Set-Location "C:\Users\Admin\Desktop\CV drone\drone-vision-platform"
+powershell -ExecutionPolicy Bypass -File .\scripts\repair_wsl_docker.ps1 -CheckCuda
 ```
 
----
+The CUDA repair path is successful only after a real Docker GPU smoke test passes. It should be an occasional repair command, not the normal launch path.
 
-## 🔌 API Reference
+See [WSL_DOCKER_STABILITY.md](docs/WSL_DOCKER_STABILITY.md).
 
-### Auth
-```
-POST /api/v1/auth/login       { email, password } → token
-GET  /api/v1/auth/me          → current user
-```
+## Addresses
 
-### Cameras
-```
-GET    /api/v1/cameras
-POST   /api/v1/cameras        { name, rtsp_url, ai_mode, ... }
-PATCH  /api/v1/cameras/{id}
-DELETE /api/v1/cameras/{id}
-POST   /api/v1/cameras/{id}/start
-POST   /api/v1/cameras/{id}/stop
-POST   /api/v1/cameras/{id}/test
-```
-
-### Tracks & Events
-```
-GET /api/v1/tracks            ?plate=&color=&camera_id=
-GET /api/v1/tracks/active
-GET /api/v1/events            ?event_type=&date_from=&date_to=
-GET /api/v1/events/export     ?format=csv|excel|json
-```
-
-### Gemini settings and review
-```text
-GET  /api/v1/settings/gemini
-PUT  /api/v1/settings/gemini
-POST /api/v1/settings/gemini/test
-
-GET   /api/v1/gemini/candidates
-GET   /api/v1/gemini/candidates/{id}
-GET   /api/v1/gemini/candidates/{id}/image
-GET   /api/v1/gemini/candidates/{id}/mask
-PATCH /api/v1/gemini/candidates/{id}/review
-POST  /api/v1/gemini/candidates/{id}/retry
-```
-
-### Training API (`:8001`)
-```text
-GET  /api/v1/training/datasets
-POST /api/v1/training/datasets
-POST /api/v1/training/datasets/import-gemini
-POST /api/v1/training/datasets/{id}/split
-
-GET  /api/v1/training/jobs
-POST /api/v1/training/jobs
-GET  /api/v1/training/registry
-POST /api/v1/training/registry/{id}/validate
-POST /api/v1/training/registry/{id}/approve
-POST /api/v1/training/registry/rollback
-```
-
-### Video Stream
-```
-GET /api/v1/stream/{camera_id}    → MJPEG stream (annotated video)
-WS  /ws/live/{camera_id}?token=   → WebSocket metadata
-```
-
-### WebSocket Message Format
-```json
-{
-  "camera_id": 1,
-  "timestamp": "2026-06-25T10:30:00",
-  "fps": 24.5,
-  "latency_ms": 87,
-  "frame_width": 1920,
-  "frame_height": 1080,
-  "objects": [
-    {
-      "track_id": 17,
-      "bbox": [430, 220, 810, 560],
-      "vehicle_class": "car",
-      "plate": "AA1234BB",
-      "plate_status": "verified",
-      "plate_confidence": 0.91,
-      "color": "blue",
-      "color_confidence": 0.84
-    }
-  ]
-}
-```
-
----
-
-## 🚨 Watchlist & Alerts
-
-1. Go to **Watchlist** → Add plate number
-2. Select alert channels: frontend / webhook / telegram
-3. When detected, alert fires in real-time
-
-**Telegram setup:**
-```env
-TELEGRAM_BOT_TOKEN=your_bot_token
-TELEGRAM_CHAT_ID=your_chat_id
-```
-
-**Webhook setup:**
-```env
-WEBHOOK_URL=https://your-endpoint.com/alert
-```
-Payload: `{ type, plate, camera_id, description, payload }`
-
----
-
-## Gemini-assisted review and training capture
-
-Gemini integration is opt-in and disabled until an administrator configures an API key in **Settings -> Gemini API**. The key is encrypted by the backend and is never returned to the browser.
-
-For each camera or recorded video, the operator can independently enable detection verification, segmentation-mask collection, a minimum sampling interval, and a maximum candidate count per processing run. The full stream is never uploaded: VTP selects bounded representative track frames and stores the results in **AI Training -> Gemini Review**.
-
-A human must approve candidates before importing them into a `vehicle_segmenter` or `plate_segmenter` dataset. Approved annotations retain source, provider, camera, run and track provenance. The resulting dataset still requires an explicit train/validation/test split and Training Job. Gemini responses never trigger automatic online learning or production deployment; evaluate trained models on a separate real holdout before registry approval.
-
-Gemini produces structured instance masks, not tracker labels. These datasets train segmentation models (`yolo11n-seg` / `yolo11s-seg`); connecting a deployed segmenter to the live tracking pipeline remains an explicit integration decision rather than an automatic side effect.
-
-### Training workflow
-
-1. Create or import a dataset and verify its annotations.
-2. Create a deterministic train/validation/test split.
-3. Start a compatible Training Job.
-4. Review metrics and run model validation.
-5. Approve a model version manually in the registry, or reject/roll back it.
-
-Supported model families include vehicle/plate detectors, vehicle/plate segmenters, color classifiers and OCR. Export and deployment support depends on the selected architecture and installed runtime.
-
----
-
-## 🗄 Database Schema
-
-Key tables: `cameras`, `vehicle_tracks`, `plate_candidates`, `events`, `users`, `watchlist`, `system_logs`, `app_settings`, `gemini_review_candidates`, and the `tr_*` training tables.
-
-All RTSP credentials stored encrypted (Fernet AES-128-CBC).
-
----
-
-## 🔧 Troubleshooting
-
-| Problem | Solution |
+| Service | Address |
 |---|---|
-| Camera won't connect | Check RTSP URL format. Test with VLC first |
-| Low OCR accuracy | Check plate crop size in logs. Min 60×20px |
-| High latency | Reduce max_fps, enable frame_skip, use Speed mode |
-| GPU not used | Install `nvidia-container-toolkit`, check `nvidia-smi` |
-| Redis connection failed | System continues with in-memory only — non-critical |
-| PaddleOCR slow on CPU | Use LPRNet in Speed mode, or add GPU |
-| RF-DETR not loading | RF-DETR is optional; the registry selects the best installed YOLO artifact |
+| Web UI | http://localhost:3100 |
+| Inference API | http://localhost:8100/docs |
+| Training API | http://localhost:8101/docs |
+| Flower (`monitoring` profile) | http://localhost:5565/flower |
 
----
+Development credentials come from `INITIAL_ADMIN_EMAIL` and `INITIAL_ADMIN_PASSWORD` in `.env`.
 
-## 🔒 Security Notes
+## Main APIs
 
-- Default admin password **must** be changed in production
-- RTSP URLs encrypted at rest with Fernet (AES-128)
-- Gemini API keys encrypted at rest and never returned to the browser
-- Protected inference and training endpoints require JWT tokens and role checks
-- Gemini candidate images and masks are served only through authenticated endpoints
-- WebSocket requires token via query param
-- Role-based access: `admin > operator > viewer`
-- Change `SECRET_KEY` in `.env` before production deploy
+- `/api/v1/cameras` — live/drone source configuration and control
+- `/api/v1/videos` — recorded flight upload and processing
+- `/api/v1/objects` — persisted object tracks and trajectories
+- `/api/v1/events` — source and object lifecycle events
+- `/api/v1/analytics/performance` — runtime speed and latency
+- `/api/v1/health/ai-modes` — resolved object models for every mode
+- `/api/v1/training/*` on port 8101 — datasets, annotation, jobs and model registry
+- `/api/v1/training/active-learning` — review queue for useful frames and hard negatives
+- `/api/v1/training/evaluation/*` — validation reports, error items and gate output
+- `/ws/live/{source_id}` — live frames and object metadata
 
----
+## Validation
 
-## 📊 Target Performance
-
-| Metric | Value |
-|---|---|
-| Throughput and latency | Measure on the target CPU/GPU and real camera streams |
-| Vehicle detection precision | Measure detector mAP on client holdout |
-| OCR accuracy | Measure exact-match and character accuracy on client holdout |
-| Color recognition accuracy | Measure macro-F1 on client holdout |
-| ID stability | Measure IDF1 on representative camera sequences |
-
-Accuracy depends on camera angle, resolution, lighting, and bitrate. Use temporal voting and regex validation to compensate for difficult conditions.
-
-The current repository is a working development build, not a production certification. Validate online cameras, retention policy, alert delivery, model licenses and accuracy on a frozen labeled dataset before deployment.
-
----
-
-## 📜 Licensing
-
-No project-level license has been selected yet. Third-party model licenses are listed in `backend/models/manifest.json`; in particular, Ultralytics artifacts require compliance with their AGPL-3.0 or Enterprise terms. Choose an explicit repository license before presenting this project as open source.
-
----
-
-## 📁 Project Structure
-
+```powershell
+Set-Location frontend; npm run build
+Set-Location ..; python -m compileall -q backend/app training/backend/app
 ```
-vehicle-traffic-platform/
-├── backend/
-│   ├── app/
-│   │   ├── main.py              FastAPI app + lifespan
-│   │   ├── config.py            All settings
-│   │   ├── api/routers.py       All REST endpoints
-│   │   ├── models/
-│   │   │   ├── database.py      SQLAlchemy models
-│   │   │   └── model_registry.py  AI model config
-│   │   ├── services/
-│   │   │   ├── inference_service.py     Main pipeline
-│   │   │   ├── gemini_training_service.py
-│   │   │   ├── vehicle_detection_service.py
-│   │   │   ├── tracking_service.py
-│   │   │   ├── plate_detection_service.py
-│   │   │   ├── ocr_service.py
-│   │   │   ├── color_recognition_service.py
-│   │   │   ├── frame_quality_service.py
-│   │   │   ├── track_state_service.py
-│   │   │   ├── video_capture_service.py
-│   │   │   ├── camera_manager.py
-│   │   │   ├── event_service.py
-│   │   │   └── websocket_service.py
-│   │   ├── schemas/schemas.py   Pydantic schemas
-│   │   └── utils/auth.py        JWT, encryption
-│   ├── models/                  AI model weights
-│   ├── requirements.txt
-│   └── Dockerfile
-├── training/
-│   ├── backend/app/
-│   │   ├── api/routers.py       Dataset, job, registry and Gemini-import API
-│   │   ├── services/            Annotation, dataset and registry services
-│   │   └── workers/             Training, validation and export workers
-│   ├── backend/tests/
-│   └── Dockerfile.worker
-├── frontend/
-│   ├── src/app/
-│   │   ├── dashboard/page.tsx
-│   │   ├── cameras/page.tsx
-│   │   ├── live/page.tsx
-│   │   ├── events/page.tsx
-│   │   ├── vehicles/page.tsx
-│   │   ├── analytics/page.tsx
-│   │   ├── watchlist/page.tsx
-│   │   ├── settings/page.tsx
-│   │   ├── health/page.tsx
-│   │   ├── login/page.tsx
-│   │   └── training/             Datasets, annotation, jobs, registry and Gemini review
-│   ├── src/hooks/
-│   │   ├── useAuth.ts
-│   │   └── useWebSocket.ts
-│   ├── src/lib/api.ts
-│   ├── src/types/index.ts
-│   └── Dockerfile
-├── nginx/nginx.conf
-├── scripts/
-│   ├── download_models.py
-│   └── start.sh
-├── start.cmd / start.ps1
-├── docker-compose.yml
-├── .env.example
-└── README.md
+
+For release-quality validation, use a frozen labeled aerial holdout and record per-class precision/recall/mAP, AP-small/Recall-small, FP/frame, FN/frame, IDF1/MOTA/HOTA, P50/P95 latency, FPS and memory on the target hardware. The current control plane stores evaluation reports and gate decisions; final production acceptance still depends on real holdout data.
+
+## Repository layout
+
+```text
+backend/             inference API and live runtime
+frontend/            Next.js/Tailwind operator UI
+training/backend/    dataset, annotation, training and registry API
+runtime/cpp/         C++ ONNX edge reference runtime
+simulation/unity/    Unity integration contract
+scripts/             launch and model utilities
+docs/                engineering status and roadmap
 ```
+
+## Production boundary
+
+This is an engineering platform, not a certified safety system. Production approval still requires target-hardware benchmarks, long-running source tests, retention/backup rules, secret management and explicit acceptance thresholds.

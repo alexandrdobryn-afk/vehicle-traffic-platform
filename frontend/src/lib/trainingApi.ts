@@ -1,6 +1,10 @@
 import axios from 'axios'
+import { browserEndpoint } from './runtimeUrl'
 
-const TRAINING_URL = process.env.NEXT_PUBLIC_TRAINING_API_URL || 'http://localhost:8001'
+const TRAINING_URL = browserEndpoint(
+  process.env.NEXT_PUBLIC_TRAINING_API_URL || 'http://localhost:8101',
+  '8101',
+)
 
 export const trainingApi = axios.create({
   baseURL: `${TRAINING_URL}/api/v1/training`,
@@ -9,7 +13,7 @@ export const trainingApi = axios.create({
 
 trainingApi.interceptors.request.use((config) => {
   if (typeof window !== 'undefined') {
-    const token = localStorage.getItem('vtp_token')
+    const token = localStorage.getItem('bevp_token')
     if (token) config.headers.Authorization = `Bearer ${token}`
   }
   return config
@@ -19,7 +23,7 @@ trainingApi.interceptors.response.use(
   (r) => r,
   (err) => {
     if (err.response?.status === 401 && typeof window !== 'undefined') {
-      localStorage.removeItem('vtp_token')
+      localStorage.removeItem('bevp_token')
       window.location.href = '/login'
     }
     return Promise.reject(err)
@@ -27,6 +31,6 @@ trainingApi.interceptors.response.use(
 )
 
 export const TRAINING_WS_URL =
-  process.env.NEXT_PUBLIC_TRAINING_WS_URL || 'ws://localhost:8001'
+  browserEndpoint(process.env.NEXT_PUBLIC_TRAINING_WS_URL || 'ws://localhost:8101', '8101', true)
 
 export default trainingApi

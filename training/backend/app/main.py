@@ -16,6 +16,7 @@ from app.models.database import engine, init_db, get_db
 from app.api.routers import (
     datasets_router, annotations_router, jobs_router,
     registry_router, gpu_router, arch_router,
+    active_learning_router, evaluation_router,
 )
 from app.utils.auth import decode_token
 
@@ -36,10 +37,10 @@ async def lifespan(app: FastAPI):
         settings.SECRET_KEY.startswith("change-me-") or len(settings.SECRET_KEY) < 32
     ):
         raise RuntimeError("Production requires a unique SECRET_KEY of at least 32 characters")
-    if settings.APP_ENV.lower() == "production" and "vtp_pass" in settings.DATABASE_URL:
+    if settings.APP_ENV.lower() == "production" and "bevp_pass" in settings.DATABASE_URL:
         raise RuntimeError("Production requires a unique PostgreSQL password")
 
-    logger.info("🚀 Starting VTP Training Platform...")
+    logger.info("рџљЂ Starting BEVP Training Platform...")
 
     # Configure every ORM relationship before advertising readiness. Metadata
     # creation alone does not catch ambiguous relationships.
@@ -54,18 +55,18 @@ async def lifespan(app: FastAPI):
 
     # Init DB tables
     await init_db()
-    logger.info("✅ Training DB initialized")
+    logger.info("вњ… Training DB initialized")
 
     # Redis
     try:
         redis_client = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
         await redis_client.ping()
-        logger.info("✅ Redis connected")
+        logger.info("вњ… Redis connected")
     except Exception as e:
-        logger.warning(f"⚠️  Redis unavailable: {e}")
+        logger.warning(f"вљ пёЏ  Redis unavailable: {e}")
         redis_client = None
 
-    logger.info(f"✅ Training API ready on port {settings.PORT}")
+    logger.info(f"вњ… Training API ready on port {settings.PORT}")
     yield
 
     if redis_client:
@@ -73,7 +74,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="VTP Training Platform",
+    title="BEVP Training Platform",
     version="1.0.0",
     description="AI model training and lifecycle management",
     lifespan=lifespan,
@@ -82,6 +83,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.CORS_ORIGINS,
+    allow_origin_regex=r"http://172\.\d+\.\d+\.\d+:3100" if settings.APP_ENV.lower() == "development" else None,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -94,12 +96,42 @@ app.include_router(jobs_router)
 app.include_router(registry_router)
 app.include_router(gpu_router)
 app.include_router(arch_router)
+app.include_router(active_learning_router)
+app.include_router(evaluation_router)
 
 # Static files for dataset images
 app.mount("/data", StaticFiles(directory=settings.DATA_ROOT), name="data")
 
 
-# ═══ WEBSOCKET — Live Training Progress ══════════════════════════
+def _celery_workers_ready() -> bool:
+    try:
+        from app.celery_app import celery_app
+
+        inspect = celery_app.control.inspect(timeout=2)
+        active = inspect.active()
+        return active is not None
+    except Exception:
+        return False
+
+
+async def _ensure_redis_client():
+    global redis_client
+
+    if redis_client is None:
+        redis_client = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
+    try:
+        await asyncio.wait_for(redis_client.ping(), timeout=2)
+        return redis_client
+    except Exception:
+        try:
+            await redis_client.close()
+        except Exception:
+            pass
+        redis_client = None
+        raise
+
+
+# === WEBSOCKET — Live Training Progress ==========================
 @app.websocket("/ws/training/{job_id}")
 async def training_ws(
     websocket: WebSocket,
@@ -199,9 +231,13 @@ async def training_ws(
     logger.info(f"WS client disconnected from job {job_id}")
 
 
-# ═══ HEALTH ══════════════════════════════════════════════════════
-@app.get("/api/v1/training/health")
-async def health(response: Response):
+# === HEALTH ======================================================
+@app.get("/api/v1/training/health/live")
+async def health_live():
+    return {"status": "ok", "service": "training-api"}
+
+
+async def _training_ready_state() -> dict:
     orm_ok = True
     try:
         configure_mappers()
@@ -218,32 +254,55 @@ async def health(response: Response):
         logger.exception("Training database readiness check failed")
 
     redis_ok = False
-    if redis_client:
-        try:
-            await redis_client.ping()
-            redis_ok = True
-        except Exception:
-            pass
-
-    # Check Celery workers
-    workers_ok = False
     try:
-        from app.celery_app import celery_app
-        inspect = celery_app.control.inspect(timeout=2)
-        active = inspect.active()
-        workers_ok = active is not None
+        await _ensure_redis_client()
+        redis_ok = True
     except Exception:
-        pass
+        logger.exception("Training Redis readiness check failed")
 
-    ready = orm_ok and database_ok and redis_ok and workers_ok
-    if not ready:
-        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
-
+    startup_ready = orm_ok and database_ok and redis_ok
     return {
-        "status": "ok" if ready else "degraded",
+        "status": "ok" if startup_ready else "degraded",
         "orm": "ok" if orm_ok else "error",
         "database": "ok" if database_ok else "error",
         "redis": "ok" if redis_ok else "unavailable",
-        "celery_workers": "ok" if workers_ok else "no workers",
         "version": "1.0.0",
+        "ready": startup_ready,
+    }
+
+
+@app.get("/api/v1/training/health/ready")
+async def health_ready(response: Response):
+    state = await _training_ready_state()
+    if not state["ready"]:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    return {key: value for key, value in state.items() if key != "ready"}
+
+
+@app.get("/api/v1/training/health/workers")
+async def health_workers():
+    workers_ok = await asyncio.to_thread(_celery_workers_ready)
+    return {
+        "status": "ok" if workers_ok else "degraded",
+        "celery_workers": "ok" if workers_ok else "no workers",
+        "note": "Worker status is diagnostic only and does not control Compose readiness.",
+    }
+
+
+@app.get("/api/v1/training/health")
+async def health(response: Response):
+    state = await _training_ready_state()
+
+    # Worker status is intentionally diagnostic only. Compose uses /health/ready.
+    workers_ok = await asyncio.to_thread(_celery_workers_ready)
+    if not state["ready"]:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+
+    return {
+        "status": "ok" if state["ready"] and workers_ok else "degraded",
+        "orm": state["orm"],
+        "database": state["database"],
+        "redis": state["redis"],
+        "celery_workers": "ok" if workers_ok else "no workers",
+        "version": state["version"],
     }

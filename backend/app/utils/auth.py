@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+﻿from datetime import datetime, timedelta, timezone
 from typing import Optional
 from jose import JWTError, jwt
 from passlib.context import CryptContext
@@ -24,7 +24,7 @@ def get_fernet() -> Fernet:
         if not key:
             # Keep encrypted camera URLs decryptable across restarts.
             digest = hashlib.sha256(
-                ("vtp:rtsp-url:" + settings.SECRET_KEY).encode("utf-8")
+                ("bevp:rtsp-url:" + settings.SECRET_KEY).encode("utf-8")
             ).digest()
             key = base64.urlsafe_b64encode(digest).decode("ascii")
         try:

@@ -2,9 +2,10 @@
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
 import {
-  LayoutDashboard, Camera, PlayCircle, List, Car,
-  BarChart2, AlertTriangle, Settings, Activity, LogOut,
-  Shield, Zap, Database, Archive, ChevronDown, ChevronRight, FileVideo, ScanSearch
+  LayoutDashboard, Camera, PlayCircle, List,
+  BarChart2, Settings, Activity, LogOut,
+  Zap, Database, Archive, ChevronDown, ChevronRight, FileVideo, ScanSearch,
+  Radar, ListChecks, ClipboardCheck, Boxes, FlaskConical
 } from 'lucide-react'
 import { useAuth } from '@/hooks/useAuth'
 import { cn } from '@/lib/utils'
@@ -16,10 +17,10 @@ const NAV_INFERENCE = [
   { href: '/cameras', label: 'Cameras', icon: Camera },
   { href: '/videos', label: 'Videos', icon: FileVideo },
   { href: '/live', label: 'Live View', icon: PlayCircle },
-  { href: '/events', label: 'Events', icon: List },
-  { href: '/vehicles', label: 'Vehicles', icon: Car },
+  { href: '/objects', label: 'Objects', icon: List },
   { href: '/analytics', label: 'Analytics', icon: BarChart2 },
-  { href: '/watchlist', label: 'Watchlist', icon: AlertTriangle },
+  { href: '/experiments', label: 'Experiments', icon: FlaskConical },
+  { href: '/modules', label: 'Modules', icon: Boxes },
   { href: '/settings', label: 'Settings', icon: Settings },
   { href: '/health', label: 'System Health', icon: Activity },
 ]
@@ -28,7 +29,9 @@ const NAV_TRAINING = [
   { href: '/training', label: 'Training Hub', icon: Zap },
   { href: '/training/gemini-review', label: 'Gemini Review', icon: ScanSearch },
   { href: '/training/datasets', label: 'Datasets', icon: Database },
+  { href: '/training/active-learning', label: 'Active Learning', icon: ListChecks },
   { href: '/training/jobs', label: 'Jobs', icon: PlayCircle },
+  { href: '/training/evaluation', label: 'Evaluation', icon: ClipboardCheck },
   { href: '/training/registry', label: 'Model Registry', icon: Archive },
 ]
 
@@ -64,11 +67,11 @@ export default function Sidebar() {
       <div className="p-5 border-b border-border">
         <div className="flex items-center gap-3">
           <div className="w-8 h-8 bg-primary/10 rounded-lg flex items-center justify-center">
-            <Shield className="w-4 h-4 text-primary" />
+            <Radar className="w-4 h-4 text-primary" />
           </div>
           <div>
-            <p className="text-sm font-bold text-foreground leading-tight">VTP</p>
-            <p className="text-xs text-muted-foreground leading-tight">{t('Traffic Platform')}</p>
+            <p className="text-sm font-bold text-foreground leading-tight">BEVP</p>
+            <p className="text-xs text-muted-foreground leading-tight">{t("Bird's-Eye Vision")}</p>
           </div>
         </div>
       </div>
@@ -77,7 +80,7 @@ export default function Sidebar() {
       <nav className="flex-1 p-3 space-y-0.5 overflow-y-auto">
         {/* Inference section */}
         <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide px-3 py-2 mt-1">
-          {t('Monitoring')}
+          {t('Aerial analysis')}
         </p>
         {NAV_INFERENCE.map((item) => (
           <NavItem key={item.href} {...item} />

@@ -5,14 +5,16 @@ services:
       dockerfile: Dockerfile.gpu
     gpus: all
     shm_size: "2gb"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     environment:
+      AI_RUNTIME: cuda-fp32
       AI_INFERENCE_CONCURRENCY: "1"
-      NVIDIA_VISIBLE_DEVICES: all
-      NVIDIA_DRIVER_CAPABILITIES: compute,utility
-
-  training-api:
-    gpus: all
-    environment:
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
 
@@ -21,6 +23,14 @@ services:
       context: ./training/backend
       dockerfile: ../Dockerfile.worker
     gpus: all
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     environment:
+      AI_RUNTIME: cuda-fp32
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,utility

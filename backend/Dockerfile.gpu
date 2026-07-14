@@ -1,4 +1,4 @@
-FROM python:3.11-slim-bookworm
+﻿FROM python:3.11-slim-bookworm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 libglib2.0-0 libsm6 libxext6 libxrender1 libgomp1 ffmpeg \
@@ -16,16 +16,17 @@ RUN pip install -r requirements.txt
 RUN pip install -r requirements-ai-optional.txt
 RUN pip uninstall -y onnxruntime && pip install onnxruntime-gpu==1.20.1
 RUN pip install --no-cache-dir lap==0.5.13 protobuf==4.25.8
+RUN pip install --no-cache-dir --no-deps ocsort==0.0.2
 
 COPY . .
 RUN python scripts/image_integrity_check.py
 RUN mkdir -p /app/storage/crops /app/storage/frames /app/models && \
-    useradd -m -u 1000 vtp && \
-    mkdir -p /home/vtp/.paddleocr /home/vtp/.paddlex /home/vtp/.EasyOCR \
-        /home/vtp/.cache /home/vtp/.config/Ultralytics && \
-    chown -R vtp:vtp /app /home/vtp
-USER vtp
-ENV YOLO_CONFIG_DIR=/home/vtp/.config/Ultralytics
+    useradd -m -u 1000 bevp && \
+    mkdir -p /home/bevp/.paddleocr /home/bevp/.paddlex /home/bevp/.EasyOCR \
+        /home/bevp/.cache /home/bevp/.config/Ultralytics && \
+    chown -R bevp:bevp /app /home/bevp
+USER bevp
+ENV YOLO_CONFIG_DIR=/home/bevp/.config/Ultralytics
 ENV AI_RUNTIME=cuda-fp32
 EXPOSE 8000
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

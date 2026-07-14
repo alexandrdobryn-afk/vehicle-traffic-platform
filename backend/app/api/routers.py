@@ -1,4 +1,5 @@
 import asyncio
+import importlib.util
 import json
 import os
 import secrets
@@ -17,16 +18,17 @@ from zoneinfo import ZoneInfo
 import logging
 
 from app.models.database import (
-    Camera, VehicleTrack, PlateCandidate, Event,
-    User, WatchlistEntry, AppSettings, GeminiReviewCandidate, get_db
+    Camera, ObjectTrack, Event,
+    User, AppSettings, GeminiReviewCandidate, PipelineDefinition, Project, get_db
 )
 from app.schemas.schemas import (
     CameraCreate, CameraUpdate, CameraResponse,
-    TrackResponse, EventResponse, WatchlistCreate, WatchlistResponse,
+    ObjectTrackResponse, EventResponse,
     AnalyticsSummaryResponse, LoginRequest, TokenResponse,
     UserCreate, UserResponse, AppSettingsSchema, GeminiSettingsUpdate, GeminiCandidateReview,
     AIMode, validate_camera_source_url, validate_pipeline_config,
 )
+from app.defaults import default_source_pipeline_config
 from app.config import settings
 from app.utils.auth import (
     hash_password, verify_password, create_access_token,
@@ -39,7 +41,7 @@ from app.services.gemini_training_service import gemini_training_service
 
 logger = logging.getLogger(__name__)
 
-# ═══ AUTH ════════════════════════════════════════════════════════
+# === AUTH ========================================================
 auth_router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
 
 
@@ -84,7 +86,7 @@ async def create_user(req: UserCreate, db: AsyncSession = Depends(get_db)):
     return user
 
 
-# ═══ CAMERAS ═════════════════════════════════════════════════════
+# === CAMERAS =====================================================
 cameras_router = APIRouter(prefix="/api/v1/cameras", tags=["cameras"])
 videos_router = APIRouter(prefix="/api/v1/videos", tags=["recorded videos"])
 
@@ -131,7 +133,7 @@ def _decorate_source_status(cam: Camera):
 
 def _parse_pipeline_config(raw: str | None) -> dict:
     if not raw:
-        return {}
+        return default_source_pipeline_config()
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -145,15 +147,8 @@ def _parse_pipeline_config(raw: str | None) -> dict:
 
 
 SOURCE_LOCAL_SETTING_KEYS = {
-    "vehicle_confidence_threshold",
-    "plate_confidence_threshold",
-    "ocr_threshold",
-    "plate_regex_profile",
-    "input_resolution",
-    "ocr_voting_window",
+    "object_confidence_threshold",
     "track_missing_grace_frames",
-    "minimum_plate_width",
-    "minimum_plate_height",
 }
 
 
@@ -163,25 +158,35 @@ RUNTIME_SETTING_KEYS = {
 
 
 async def _global_settings(db: AsyncSession) -> dict:
-    defaults = AppSettingsSchema().model_dump()
+    defaults = {**default_source_pipeline_config(), **AppSettingsSchema().model_dump()}
     result = await db.execute(select(AppSettings).where(AppSettings.key == "global"))
     row = result.scalar_one_or_none()
     return {**defaults, **(row.value or {})} if row else defaults
 
 
-def _pipeline_runtime_settings(cam: Camera, global_settings: Optional[dict] = None) -> dict:
+def _pipeline_runtime_settings(cam: Camera, global_settings: Optional[dict] = None, pipeline: Optional[PipelineDefinition] = None) -> dict:
     """Combine source recognition choices with global compute policy only."""
-    defaults = AppSettingsSchema().model_dump()
-    config = cam.pipeline_config or {}
+    source_defaults = default_source_pipeline_config()
+    runtime_defaults = AppSettingsSchema().model_dump()
+    local_config = {
+        key: value for key, value in (cam.pipeline_config or {}).items()
+        if value not in (None, "")
+    }
+    config = {**source_defaults, **((pipeline.config if pipeline else {}) or {}), **local_config}
     runtime_settings = {
-        key: config.get(key, defaults[key])
+        key: config.get(key, source_defaults[key])
         for key in SOURCE_LOCAL_SETTING_KEYS
     }
     frame_skip = config.get("frame_skip")
     if isinstance(frame_skip, int) and 1 <= frame_skip <= 10:
         runtime_settings["frame_skip"] = frame_skip
-    runtime_settings["pipeline_mode"] = cam.pipeline_mode or "automatic"
+    runtime_settings["pipeline_mode"] = "manual" if pipeline else (cam.pipeline_mode or "automatic")
     runtime_settings["pipeline_config"] = config
+    runtime_settings["task_profile"] = "aerial_small_objects"
+    runtime_settings["pipeline_definition"] = (
+        {"id": pipeline.id, "name": pipeline.name, "version": pipeline.version}
+        if pipeline else None
+    )
     runtime_settings["save_crops"] = bool(cam.save_crops)
     runtime_settings["anonymization_mode"] = bool(cam.anonymization)
     runtime_settings["gemini_enabled"] = bool(cam.gemini_enabled)
@@ -189,10 +194,14 @@ def _pipeline_runtime_settings(cam: Camera, global_settings: Optional[dict] = No
     runtime_settings["gemini_collect_training"] = bool(cam.gemini_collect_training)
     runtime_settings["gemini_sample_interval_seconds"] = int(cam.gemini_sample_interval_seconds or 30)
     runtime_settings["gemini_max_candidates_per_run"] = int(cam.gemini_max_candidates_per_run or 25)
-    global_settings = global_settings or defaults
+    global_settings = global_settings or {**source_defaults, **runtime_defaults}
     for key in RUNTIME_SETTING_KEYS:
-        runtime_settings[key] = global_settings.get(key, defaults[key])
+        runtime_settings[key] = global_settings.get(key, runtime_defaults[key])
     return runtime_settings
+
+
+async def _resolved_pipeline_runtime_settings(cam: Camera, db: AsyncSession, global_settings: Optional[dict] = None) -> dict:
+    return _pipeline_runtime_settings(cam, global_settings or await _global_settings(db), None)
 
 
 async def _delete_source_records(cam: Camera, db: AsyncSession):
@@ -207,10 +216,8 @@ async def _delete_source_records(cam: Camera, db: AsyncSession):
             if annotation.get("mask_path"):
                 Path(annotation["mask_path"]).unlink(missing_ok=True)
     await db.execute(delete(GeminiReviewCandidate).where(GeminiReviewCandidate.camera_id == cam.id))
-    track_ids = select(VehicleTrack.id).where(VehicleTrack.camera_id == cam.id)
-    await db.execute(delete(PlateCandidate).where(PlateCandidate.vehicle_track_id.in_(track_ids)))
     await db.execute(delete(Event).where(Event.camera_id == cam.id))
-    await db.execute(delete(VehicleTrack).where(VehicleTrack.camera_id == cam.id))
+    await db.execute(delete(ObjectTrack).where(ObjectTrack.source_id == cam.id))
     await db.delete(cam)
 
 
@@ -258,6 +265,8 @@ async def list_recorded_videos(
 async def upload_recorded_video(
     file: UploadFile = File(...),
     name: str = Form(...),
+    project_id: Optional[int] = Form(default=None),
+    task_profile: str = Form(default="aerial_small_objects"),
     location: Optional[str] = Form(default=None),
     ai_mode: str = Form(default="balanced"),
     pipeline_mode: str = Form(default="automatic"),
@@ -286,6 +295,8 @@ async def upload_recorded_video(
         )
     if ai_mode not in {mode.value for mode in AIMode}:
         raise HTTPException(status_code=422, detail="Invalid AI mode")
+    if task_profile != "aerial_small_objects":
+        raise HTTPException(status_code=422, detail="Invalid task profile")
     if pipeline_mode not in {"automatic", "manual"}:
         raise HTTPException(status_code=422, detail="Invalid pipeline mode")
     parsed_pipeline_config = _parse_pipeline_config(pipeline_config)
@@ -321,6 +332,7 @@ async def upload_recorded_video(
             )
 
         video = Camera(
+            project_id=project_id,
             name=clean_name,
             rtsp_url_encrypted=encrypt_url("managed-recorded-video"),
             source_type="file",
@@ -331,6 +343,7 @@ async def upload_recorded_video(
             location=location.strip() if location else None,
             status="offline",
             ai_mode=ai_mode,
+            task_profile=task_profile,
             pipeline_mode=pipeline_mode,
             pipeline_config=parsed_pipeline_config,
             priority=priority,
@@ -385,7 +398,11 @@ async def start_recorded_video(
         if not gemini_config.get("configured") or not gemini_config.get("enabled"):
             raise HTTPException(status_code=409, detail="Configure and enable Gemini API before starting this source")
 
-    runtime_settings = _pipeline_runtime_settings(video, await _global_settings(db))
+    await db.execute(delete(Event).where(Event.camera_id == video.id))
+    await db.execute(delete(ObjectTrack).where(ObjectTrack.source_id == video.id))
+    await db.flush()
+
+    runtime_settings = await _resolved_pipeline_runtime_settings(video, db)
     success = await camera_manager.start_camera(
         camera_id=video.id,
         rtsp_url=_camera_source(video),
@@ -398,6 +415,12 @@ async def start_recorded_video(
         video.is_active = True
         video.status = "online"
         await db.commit()
+    else:
+        video.is_active = False
+        video.status = "error"
+        await db.commit()
+        reason = camera_manager.get_last_start_error(video.id) or "pipeline did not start"
+        raise HTTPException(status_code=409, detail=f"Could not start video analysis: {reason}")
     return {"success": success, "video_id": video_id}
 
 
@@ -441,13 +464,24 @@ async def create_camera(
     db: AsyncSession = Depends(get_db),
     user=Depends(require_operator),
 ):
+    if req.project_id and not await db.get(Project, req.project_id):
+        raise HTTPException(status_code=404, detail="Project not found")
+    if req.pipeline_id:
+        selected_pipeline = await db.get(PipelineDefinition, req.pipeline_id)
+        if not selected_pipeline:
+            raise HTTPException(status_code=404, detail="Pipeline not found")
+        if req.project_id != selected_pipeline.project_id:
+            raise HTTPException(status_code=422, detail="Pipeline must belong to the selected project")
     cam = Camera(
+        project_id=req.project_id,
+        pipeline_id=req.pipeline_id,
         name=req.name,
         rtsp_url_encrypted=encrypt_url(req.rtsp_url),
         source_type=req.source_type.value,
         snapshot_interval_seconds=req.snapshot_interval_seconds,
         location=req.location,
         ai_mode=req.ai_mode,
+        task_profile=req.task_profile.value,
         pipeline_mode=req.pipeline_mode,
         pipeline_config=req.pipeline_config,
         priority=req.priority,
@@ -481,6 +515,14 @@ async def update_camera(
 ):
     cam = await _get_camera_or_404(camera_id, db)
     changes = req.model_dump(exclude_none=True)
+    effective_project_id = changes.get("project_id", cam.project_id)
+    effective_pipeline_id = changes.get("pipeline_id", cam.pipeline_id)
+    if effective_pipeline_id:
+        selected_pipeline = await db.get(PipelineDefinition, effective_pipeline_id)
+        if not selected_pipeline:
+            raise HTTPException(status_code=404, detail="Pipeline not found")
+        if selected_pipeline.project_id != effective_project_id:
+            raise HTTPException(status_code=422, detail="Pipeline must belong to the selected project")
     current_source_type = cam.source_type or "rtsp"
     effective_source_type = changes.get("source_type", current_source_type)
     if hasattr(effective_source_type, "value"):
@@ -511,7 +553,7 @@ async def update_camera(
     await db.commit()
     await db.refresh(cam)
     if was_running:
-        runtime_settings = _pipeline_runtime_settings(cam, await _global_settings(db))
+        runtime_settings = await _resolved_pipeline_runtime_settings(cam, db)
         await camera_manager.restart_camera(
             camera_id=camera_id,
             rtsp_url=_camera_source(cam),
@@ -556,7 +598,7 @@ async def start_camera(camera_id: int, db: AsyncSession = Depends(get_db), user=
         gemini_config = await gemini_training_service.get_public_settings()
         if not gemini_config.get("configured") or not gemini_config.get("enabled"):
             raise HTTPException(status_code=409, detail="Configure and enable Gemini API before starting this source")
-    runtime_settings = _pipeline_runtime_settings(cam, await _global_settings(db))
+    runtime_settings = await _resolved_pipeline_runtime_settings(cam, db)
     success = await camera_manager.start_camera(
         camera_id=camera_id,
         rtsp_url=url,
@@ -583,7 +625,7 @@ async def stop_camera(camera_id: int, db: AsyncSession = Depends(get_db), user=D
     return {"success": success, "camera_id": camera_id}
 
 
-# ═══ STREAMS (MJPEG) ═════════════════════════════════════════════
+# === STREAMS (MJPEG) =============================================
 streams_router = APIRouter(prefix="/api/v1/stream", tags=["streams"])
 
 
@@ -632,27 +674,24 @@ async def preview_snapshot(camera_id: int, authorized=Depends(require_stream_tic
     )
 
 
-# ═══ TRACKS ══════════════════════════════════════════════════════
+# === TRACKS ======================================================
 tracks_router = APIRouter(prefix="/api/v1/tracks", tags=["tracks"])
 
 
-@tracks_router.get("", response_model=List[TrackResponse])
+@tracks_router.get("", response_model=List[ObjectTrackResponse])
 async def list_tracks(
-    camera_id: Optional[int] = None,
-    plate: Optional[str] = None,
-    color: Optional[str] = None,
+    source_id: Optional[int] = None,
+    object_class: Optional[str] = None,
     limit: int = Query(50, le=500),
     offset: int = 0,
     db: AsyncSession = Depends(get_db),
     user=Depends(require_viewer),
 ):
-    q = select(VehicleTrack).order_by(desc(VehicleTrack.last_seen))
-    if camera_id:
-        q = q.where(VehicleTrack.camera_id == camera_id)
-    if plate:
-        q = q.where(VehicleTrack.final_plate.ilike(f"%{plate}%"))
-    if color:
-        q = q.where(VehicleTrack.color == color)
+    q = select(ObjectTrack).order_by(desc(ObjectTrack.last_seen))
+    if source_id:
+        q = q.where(ObjectTrack.source_id == source_id)
+    if object_class:
+        q = q.where(ObjectTrack.object_class == object_class)
     q = q.limit(limit).offset(offset)
     result = await db.execute(q)
     return result.scalars().all()
@@ -660,7 +699,7 @@ async def list_tracks(
 
 @tracks_router.get("/active")
 async def active_tracks(camera_id: Optional[int] = None, user=Depends(require_viewer)):
-    """Return currently tracked vehicles from in-memory state."""
+    """Return currently tracked objects from in-memory state."""
     if camera_id:
         pipeline = camera_manager.get_pipeline(camera_id)
         if pipeline:
@@ -679,16 +718,16 @@ async def active_tracks(camera_id: Optional[int] = None, user=Depends(require_vi
     return all_tracks
 
 
-@tracks_router.get("/{track_id}", response_model=TrackResponse)
+@tracks_router.get("/{track_id}", response_model=ObjectTrackResponse)
 async def get_track(track_id: int, db: AsyncSession = Depends(get_db), user=Depends(require_viewer)):
-    result = await db.execute(select(VehicleTrack).where(VehicleTrack.id == track_id))
+    result = await db.execute(select(ObjectTrack).where(ObjectTrack.id == track_id))
     track = result.scalar_one_or_none()
     if not track:
         raise HTTPException(status_code=404, detail="Track not found")
     return track
 
 
-# ═══ EVENTS ══════════════════════════════════════════════════════
+# === EVENTS ======================================================
 events_router = APIRouter(prefix="/api/v1/events", tags=["events"])
 
 
@@ -696,7 +735,6 @@ events_router = APIRouter(prefix="/api/v1/events", tags=["events"])
 async def list_events(
     camera_id: Optional[int] = None,
     event_type: Optional[str] = None,
-    plate: Optional[str] = None,
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
     alert_only: bool = False,
@@ -711,7 +749,7 @@ async def list_events(
     if event_type:
         q = q.where(Event.event_type == event_type)
     if alert_only:
-        q = q.where(Event.event_type == "watchlist_match")
+        q = q.where(Event.event_type == "object_alert")
     if date_from:
         q = q.where(Event.created_at >= date_from)
     if date_to:
@@ -750,9 +788,9 @@ async def export_events(
             "camera_id": e.camera_id,
             "event_type": e.event_type,
             "created_at": e.created_at.isoformat() if e.created_at else "",
-            "plate": (e.payload_json or {}).get("plate", ""),
-            "color": (e.payload_json or {}).get("color", ""),
-            "vehicle_class": (e.payload_json or {}).get("vehicle_class", ""),
+            "object_class": (e.payload_json or {}).get("object_class", ""),
+            "track_id": (e.payload_json or {}).get("track_id", ""),
+            "state": (e.payload_json or {}).get("state", ""),
         }
         for e in events
     ]
@@ -781,50 +819,8 @@ async def export_events(
     )
 
 
-# ═══ WATCHLIST ════════════════════════════════════════════════════
-watchlist_router = APIRouter(prefix="/api/v1/watchlist", tags=["watchlist"])
-
-
-@watchlist_router.get("", response_model=List[WatchlistResponse])
-async def list_watchlist(db: AsyncSession = Depends(get_db), user=Depends(require_viewer)):
-    result = await db.execute(select(WatchlistEntry).order_by(WatchlistEntry.created_at.desc()))
-    return result.scalars().all()
-
-
-@watchlist_router.post("", response_model=WatchlistResponse)
-async def add_to_watchlist(req: WatchlistCreate, db: AsyncSession = Depends(get_db), user=Depends(require_operator)):
-    entry = WatchlistEntry(**req.model_dump())
-    db.add(entry)
-    await db.commit()
-    await db.refresh(entry)
-    return entry
-
-
-@watchlist_router.patch("/{entry_id}", response_model=WatchlistResponse)
-async def update_watchlist(entry_id: int, req: WatchlistCreate, db: AsyncSession = Depends(get_db), user=Depends(require_operator)):
-    result = await db.execute(select(WatchlistEntry).where(WatchlistEntry.id == entry_id))
-    entry = result.scalar_one_or_none()
-    if not entry:
-        raise HTTPException(status_code=404)
-    for k, v in req.model_dump().items():
-        setattr(entry, k, v)
-    await db.commit()
-    await db.refresh(entry)
-    return entry
-
-
-@watchlist_router.delete("/{entry_id}")
-async def delete_watchlist(entry_id: int, db: AsyncSession = Depends(get_db), user=Depends(require_admin)):
-    result = await db.execute(select(WatchlistEntry).where(WatchlistEntry.id == entry_id))
-    entry = result.scalar_one_or_none()
-    if not entry:
-        raise HTTPException(status_code=404)
-    await db.delete(entry)
-    await db.commit()
-    return {"message": "Deleted"}
-
-
-# ═══ ANALYTICS ═══════════════════════════════════════════════════
+# === WATCHLIST ====================================================
+# === ANALYTICS ===================================================
 analytics_router = APIRouter(prefix="/api/v1/analytics", tags=["analytics"])
 
 
@@ -838,23 +834,13 @@ async def analytics_summary(db: AsyncSession = Depends(get_db), user=Depends(req
         hour=0, minute=0, second=0, microsecond=0
     ).astimezone(timezone.utc)
 
-    total_today = await db.scalar(
-        select(func.count(VehicleTrack.id)).where(VehicleTrack.created_at >= today_start)
+    object_total_today = await db.scalar(
+        select(func.count(ObjectTrack.id)).where(ObjectTrack.created_at >= today_start)
     )
-    plates_recognized = await db.scalar(
-        select(func.count(VehicleTrack.id)).where(
-            VehicleTrack.final_plate.isnot(None),
-            VehicleTrack.created_at >= today_start
-        )
+    total_today = object_total_today or 0
+    event_total_today = await db.scalar(
+        select(func.count(Event.id)).where(Event.created_at >= today_start)
     )
-    watchlist_today = await db.scalar(
-        select(func.count(Event.id)).where(
-            Event.event_type == "watchlist_match",
-            Event.created_at >= today_start
-        )
-    )
-
-    ocr_rate = (plates_recognized / total_today * 100) if total_today else 0.0
     stats = camera_manager.get_all_stats()
     avg_fps = sum(s.get("fps", 0) for s in stats) / len(stats) if stats else 0.0
     avg_latency = (
@@ -864,48 +850,46 @@ async def analytics_summary(db: AsyncSession = Depends(get_db), user=Depends(req
     active_cams = sum(1 for s in stats if s.get("is_running"))
 
     return {
-        "total_vehicles_today": total_today or 0,
-        "total_plates_recognized": plates_recognized or 0,
-        "ocr_success_rate": round(ocr_rate, 1),
+        "total_objects_today": total_today,
+        "total_events_today": event_total_today or 0,
         "active_cameras": active_cams,
         "avg_fps": round(avg_fps, 1),
         "avg_latency_ms": round(avg_latency, 1),
-        "watchlist_matches_today": watchlist_today or 0,
     }
 
 
-@analytics_router.get("/traffic-volume")
-async def traffic_volume(
+@analytics_router.get("/object-volume")
+async def object_volume(
     hours: int = Query(24, le=168),
-    camera_id: Optional[int] = None,
+    source_id: Optional[int] = None,
     db: AsyncSession = Depends(get_db),
     user=Depends(require_viewer),
 ):
     from_time = datetime.now(timezone.utc) - timedelta(hours=hours)
     q = select(
-        func.date_trunc("hour", VehicleTrack.created_at).label("hour"),
-        func.count(VehicleTrack.id).label("count")
-    ).where(VehicleTrack.created_at >= from_time).group_by("hour").order_by("hour")
-    if camera_id:
-        q = q.where(VehicleTrack.camera_id == camera_id)
+        func.date_trunc("hour", ObjectTrack.created_at).label("hour"),
+        func.count(ObjectTrack.id).label("count")
+    ).where(ObjectTrack.created_at >= from_time).group_by("hour").order_by("hour")
+    if source_id:
+        q = q.where(ObjectTrack.source_id == source_id)
     result = await db.execute(q)
     rows = result.fetchall()
     return [{"timestamp": str(r.hour), "count": r.count} for r in rows]
 
 
-@analytics_router.get("/colors")
-async def color_distribution(db: AsyncSession = Depends(get_db), user=Depends(require_viewer)):
+@analytics_router.get("/classes")
+async def class_distribution(db: AsyncSession = Depends(get_db), user=Depends(require_viewer)):
     today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     result = await db.execute(
-        select(VehicleTrack.color, func.count(VehicleTrack.id).label("count"))
-        .where(VehicleTrack.created_at >= today_start)
-        .group_by(VehicleTrack.color)
+        select(ObjectTrack.object_class, func.count(ObjectTrack.id).label("count"))
+        .where(ObjectTrack.created_at >= today_start)
+        .group_by(ObjectTrack.object_class)
         .order_by(desc("count"))
     )
     rows = result.fetchall()
     total = sum(r.count for r in rows)
     return [
-        {"color": r.color, "count": r.count, "percentage": round(r.count / total * 100, 1) if total else 0}
+        {"object_class": r.object_class, "count": r.count, "percentage": round(r.count / total * 100, 1) if total else 0}
         for r in rows
     ]
 
@@ -915,7 +899,7 @@ async def performance(user=Depends(require_viewer)):
     return camera_manager.get_all_stats()
 
 
-# ═══ SETTINGS ════════════════════════════════════════════════════
+# === SETTINGS ====================================================
 settings_router = APIRouter(prefix="/api/v1/settings", tags=["settings"])
 
 
@@ -929,7 +913,8 @@ async def runtime_status(db: AsyncSession = Depends(get_db), user=Depends(requir
     from app.services.runtime_service import resolve_execution_policy
 
     config = await _global_settings(db)
-    return resolve_execution_policy(
+    return await asyncio.to_thread(
+        resolve_execution_policy,
         config["execution_provider"],
         config["gpu_device_index"],
         config["runtime_fallback"],
@@ -1079,7 +1064,8 @@ async def update_settings(
 ):
     from app.services.runtime_service import resolve_execution_policy
 
-    runtime = resolve_execution_policy(
+    runtime = await asyncio.to_thread(
+        resolve_execution_policy,
         req.execution_provider, req.gpu_device_index, req.runtime_fallback
     )
     if not runtime["available"]:
@@ -1106,7 +1092,7 @@ async def update_settings(
             rtsp_url=url,
             ai_mode=camera.ai_mode,
             max_fps=camera.max_fps,
-            runtime_settings=_pipeline_runtime_settings(camera, req.model_dump()),
+            runtime_settings=await _resolved_pipeline_runtime_settings(camera, db, req.model_dump()),
             source_type=camera.source_type,
             snapshot_interval_seconds=camera.snapshot_interval_seconds,
         ):
@@ -1118,24 +1104,62 @@ async def update_settings(
     }
 
 
-# ═══ SYSTEM HEALTH ════════════════════════════════════════════════
+# === SYSTEM HEALTH ================================================
 health_router = APIRouter(prefix="/api/v1/health", tags=["health"])
+
+
+@health_router.get("/live")
+async def liveness_check():
+    return {"status": "ok"}
+
+
+@health_router.get("/ready")
+async def readiness_check(response: Response, db: AsyncSession = Depends(get_db)):
+    import redis.asyncio as aioredis
+    from app.config import settings as cfg
+
+    database_ok = False
+    redis_ok = False
+
+    try:
+        await db.execute(select(func.count(User.id)))
+        database_ok = True
+    except Exception:
+        pass
+
+    try:
+        r = aioredis.from_url(cfg.REDIS_URL)
+        await r.ping()
+        await r.close()
+        redis_ok = True
+    except Exception:
+        pass
+
+    ready = database_ok and redis_ok
+    if not ready:
+        response.status_code = 503
+
+    return {
+        "status": "ok" if ready else "degraded",
+        "database": "ok" if database_ok else "error",
+        "redis": "ok" if redis_ok else "error",
+    }
 
 
 @health_router.get("")
 async def health_check():
     from app.models.model_registry import model_registry
-    vehicle = model_registry.get_vehicle_detector("balanced")
-    plate = model_registry.get_plate_detector("balanced")
-    ocr = model_registry.get_ocr_engine("balanced")
-    required_ready = vehicle.available and plate.available and ocr.available
+    detector = model_registry.get_object_detector("balanced")
+    segmenter = model_registry.get_object_segmenter()
+    classifier = model_registry.get_object_classifier()
+    required_ready = detector.available
     return {
         "status": "ok" if required_ready else "degraded",
         "version": "1.0.0",
         "models": {
-            "vehicle_detector": {"name": vehicle.name, "available": vehicle.available},
-            "plate_detector": {"name": plate.name, "available": plate.available},
-            "ocr": {"name": ocr.name, "available": ocr.available},
+            "object_detector": {"name": detector.name, "available": detector.available},
+            "object_segmenter": {"name": segmenter.name, "available": segmenter.available},
+            "object_classifier": {"name": classifier.name, "available": classifier.available},
         },
     }
 
@@ -1177,13 +1201,10 @@ async def full_health(db: AsyncSession = Depends(get_db), user=Depends(require_v
 async def ai_mode_profiles(user=Depends(require_viewer)):
     """Return the model artifacts currently resolved for every AI mode."""
     from app.models.model_registry import (
-        OCR_EASYOCR, OCR_FASTALPR, OCR_LPRNET, OCR_PADDLEOCR,
-        PLATE_DETECTOR_OPENIMAGEMODELS, PLATE_DETECTOR_YOLO11N,
-        PLATE_DETECTOR_YOLO8N, PLATE_DETECTOR_YOLO8N_TRT,
-        VEHICLE_DETECTOR_RFDETR_MEDIUM, VEHICLE_DETECTOR_RFDETR_NANO,
-        VEHICLE_DETECTOR_YOLO11N, VEHICLE_DETECTOR_YOLO11S,
-        VEHICLE_DETECTOR_YOLO26N, VEHICLE_DETECTOR_YOLO26N_TRT,
-        VEHICLE_DETECTOR_YOLO26S, model_registry,
+        OBJECT_CLASSIFIER_PRODUCTION, OBJECT_DETECTOR_PRODUCTION,
+        OBJECT_DETECTOR_RFDETR_MEDIUM, OBJECT_DETECTOR_RFDETR_NANO,
+        OBJECT_DETECTOR_RTDETR, OBJECT_DETECTOR_YOLO11N,
+        OBJECT_DETECTOR_YOLO11S, OBJECT_SEGMENTER_PRODUCTION, model_registry,
     )
 
     frame_skip_defaults = {
@@ -1200,64 +1221,48 @@ async def ai_mode_profiles(user=Depends(require_viewer)):
         "balanced": "bytetrack",
         "quality": "botsort",
         "hybrid": "bytetrack",
-        "practical": "tracktrack",
-        "max_accuracy": "tracktrack",
+        "practical": "ocsort",
+        "max_accuracy": "botsort",
         "edge_onnx": "bytetrack",
     }
+    tracker_availability = {
+        "bytetrack": True,
+        "botsort": True,
+        "ocsort": importlib.util.find_spec("ocsort") is not None,
+        "deepsort": importlib.util.find_spec("deep_sort_realtime") is not None,
+        # The current backend maps strongsort to the BoT-SORT adapter without
+        # external ReID. Keep it visible but do not mark it as true StrongSORT.
+        "strongsort": False,
+    }
 
-    # Color selection is mode-independent; resolve it once to avoid repeated
-    # registry warnings when the ONNX classifier is not installed.
-    color = model_registry.get_color_classifier()
-    brand = model_registry.get_brand_classifier()
     modes = []
     for mode in AIMode:
         mode_name = mode.value
-        vehicle = model_registry.get_vehicle_detector(mode_name)
-        plate = model_registry.get_plate_detector(mode_name)
-        ocr = model_registry.get_ocr_engine(mode_name)
+        detector = model_registry.get_object_detector(mode_name)
         models = [
-            _model_profile("vehicle", vehicle),
+            _model_profile("detection", detector),
             {
                 "role": "tracking",
                 "name": tracker_defaults[mode_name],
                 "format": "algorithm",
-                "available": True,
+                "available": tracker_availability.get(tracker_defaults[mode_name], False),
             },
-            _model_profile("plate", plate),
-            _model_profile("ocr", ocr),
-            (
-                _model_profile("color", color)
-                if color.available
-                else {
-                    "role": "color",
-                    "name": "HSV/KMeans fallback",
-                    "format": "algorithm",
-                    "available": True,
-                }
-            ),
-            (
-                _model_profile("brand", brand)
-                if brand.available
-                else {
-                    "role": "brand",
-                    "name": "Brand recognition unavailable",
-                    "format": "optional",
-                    "available": False,
-                }
-            ),
+            {"role": "prediction", "name": "constant_velocity_kalman", "format": "algorithm", "available": True},
+            _model_profile("classification", OBJECT_CLASSIFIER_PRODUCTION),
+            _model_profile("segmentation", OBJECT_SEGMENTER_PRODUCTION),
         ]
         if mode_name == "hybrid":
-            models.insert(1, _model_profile("vehicle_escalation", VEHICLE_DETECTOR_RFDETR_MEDIUM))
+            models.insert(1, _model_profile("detection", OBJECT_DETECTOR_RFDETR_MEDIUM))
         modes.append({
             "id": mode_name,
             "frame_skip_default": frame_skip_defaults[mode_name],
             "tracker_default": tracker_defaults[mode_name],
             "models": models,
             "features": {
-                "temporal_voting": True,
-                "vehicle_reid": False,
+                "object_memory": True,
                 "identity_stitching": True,
                 "confidence_engine": True,
+                "tiled_inference": True,
                 "onnx_runtime": mode_name == "edge_onnx",
                 "tensorrt_preferred": mode_name in {"speed", "edge_onnx"},
             },
@@ -1266,49 +1271,39 @@ async def ai_mode_profiles(user=Depends(require_viewer)):
     return {
         "modes": modes,
         "manual_options": {
-            "vehicle_detectors": [
-                _model_profile("vehicle", model)
+            "object_detectors": [
+                _model_profile("detection", model)
                 for model in [
-                    VEHICLE_DETECTOR_YOLO11N,
-                    VEHICLE_DETECTOR_YOLO11S,
-                    VEHICLE_DETECTOR_YOLO26N,
-                    VEHICLE_DETECTOR_YOLO26S,
-                    VEHICLE_DETECTOR_YOLO26N_TRT,
-                    VEHICLE_DETECTOR_RFDETR_NANO,
-                    VEHICLE_DETECTOR_RFDETR_MEDIUM,
+                    OBJECT_DETECTOR_PRODUCTION,
+                    OBJECT_DETECTOR_YOLO11N,
+                    OBJECT_DETECTOR_YOLO11S,
+                    OBJECT_DETECTOR_RFDETR_NANO,
+                    OBJECT_DETECTOR_RFDETR_MEDIUM,
+                    OBJECT_DETECTOR_RTDETR,
+                ]
+            ],
+            "verifier_detectors": [
+                _model_profile("detection", model)
+                for model in [
+                    OBJECT_DETECTOR_RFDETR_NANO,
+                    OBJECT_DETECTOR_RFDETR_MEDIUM,
                 ]
             ],
             "trackers": [
-                {"name": "bytetrack", "format": "algorithm", "available": True},
-                {"name": "botsort", "format": "algorithm", "available": True},
-                {
-                    "name": "tracktrack",
-                    "format": "algorithm",
-                    "available": True,
-                    "note": "Bundled with the installed Ultralytics tracker package.",
-                },
-            ],
-            "plate_detectors": [
-                _model_profile("plate", PLATE_DETECTOR_YOLO8N),
-                _model_profile("plate", PLATE_DETECTOR_OPENIMAGEMODELS),
-                _model_profile("plate", PLATE_DETECTOR_YOLO11N),
-                _model_profile("plate", PLATE_DETECTOR_YOLO8N_TRT),
-            ],
-            "ocr_engines": [
-                _model_profile("ocr", OCR_EASYOCR),
-                _model_profile("ocr", OCR_PADDLEOCR),
-                _model_profile("ocr", OCR_LPRNET),
-                _model_profile("ocr", OCR_FASTALPR),
+                {"name": "bytetrack", "format": "algorithm", "available": tracker_availability["bytetrack"]},
+                {"name": "botsort", "format": "algorithm", "available": tracker_availability["botsort"]},
+                {"name": "ocsort", "format": "optional algorithm", "available": tracker_availability["ocsort"]},
+                {"name": "deepsort", "format": "optional algorithm", "available": tracker_availability["deepsort"]},
+                {"name": "strongsort", "format": "optional algorithm", "available": tracker_availability["strongsort"]},
             ],
         },
         "settings_override_note": (
-            "Recognition thresholds, resolution, FPS, storage and privacy are source-local. "
-            "Global settings do not override a camera or recorded-video pipeline."
+            "Detection thresholds, aerial tiling, target classes, tracking and optional modules are source-local."
         ),
     }
 
 
-# ═══ HELPERS ══════════════════════════════════════════════════════
+# === HELPERS ======================================================
 async def _get_camera_or_404(camera_id: int, db: AsyncSession) -> Camera:
     result = await db.execute(select(Camera).where(Camera.id == camera_id))
     cam = result.scalar_one_or_none()

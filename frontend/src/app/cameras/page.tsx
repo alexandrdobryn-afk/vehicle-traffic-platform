@@ -2,11 +2,11 @@
 import { useEffect, useState } from 'react'
 import AppShell from '@/components/shared/AppShell'
 import AiModeExplainer from '@/components/shared/AiModeExplainer'
-import LocalRecognitionSettings, { LOCAL_RECOGNITION_DEFAULTS } from '@/components/shared/LocalRecognitionSettings'
+import AerialSourceSettings, { AERIAL_SOURCE_DEFAULTS } from '@/components/shared/AerialSourceSettings'
 import api from '@/lib/api'
-import { AI_MODE_OPTIONS } from '@/lib/aiModeProfiles'
+import { AI_MODE_OPTIONS, MANUAL_PIPELINE_OPTIONS, ManualPipelineOption } from '@/lib/aiModeProfiles'
 import { Camera, AIMode, CameraSourceType, PipelineMode } from '@/types'
-import { Plus, Play, Square, Trash2, Pencil, Wifi, WifiOff, RefreshCw, MapPin } from 'lucide-react'
+import { Plus, Play, Square, Trash2, Pencil, Wifi, WifiOff, RefreshCw, MapPin, X } from 'lucide-react'
 import toast from 'react-hot-toast'
 import { useTranslation } from '@/lib/i18n'
 
@@ -15,6 +15,8 @@ const SOURCE_TYPES: { value: CameraSourceType; label: string; desc: string }[] =
   { value: 'hls', label: 'HLS', desc: 'HTTP Live Streaming (.m3u8)' },
   { value: 'mjpeg', label: 'MJPEG', desc: 'Multipart HTTP video stream' },
   { value: 'jpeg', label: 'JPEG snapshots', desc: 'Periodically refreshed image URL' },
+  { value: 'usb', label: 'USB camera', desc: 'Local device index such as usb://0' },
+  { value: 'drone', label: 'Drone stream', desc: 'RTSP or UDP stream from an airborne platform' },
 ]
 
 const EMPTY_FORM = {
@@ -24,13 +26,12 @@ const EMPTY_FORM = {
   snapshot_interval_seconds: 1,
   location: '',
   ai_mode: 'balanced' as AIMode,
-  pipeline_mode: 'automatic' as PipelineMode,
+  pipeline_mode: 'manual' as PipelineMode,
   pipeline_config: {
-    vehicle_detector: '',
-    tracker: '',
-    plate_detector: '',
-    ocr_engine: '',
-    ...LOCAL_RECOGNITION_DEFAULTS,
+    ...AERIAL_SOURCE_DEFAULTS,
+    object_detector: 'yolo11s_object',
+    verifier_detector: 'rfdetr_medium_object',
+    tracker: 'bytetrack',
   },
   max_fps: 25,
   priority: 1,
@@ -43,38 +44,7 @@ const EMPTY_FORM = {
   gemini_max_candidates_per_run: 25,
 }
 
-const MANUAL_OPTIONS = {
-  vehicle_detector: [
-    { value: '', label: 'Auto from selected mode', available: true },
-    { value: 'yolo11n_vehicle', label: 'YOLO11n vehicle', available: true },
-    { value: 'yolo11s_vehicle', label: 'YOLO11s vehicle', available: true },
-    { value: 'yolo26n_vehicle', label: 'YOLO26n vehicle', available: true },
-    { value: 'yolo26s_vehicle', label: 'YOLO26s vehicle', available: true },
-    { value: 'yolo26n_vehicle_trt', label: 'YOLO26n TensorRT', available: false },
-    { value: 'rfdetr_nano_vehicle', label: 'RF-DETR Nano', available: false },
-    { value: 'rfdetr_medium_vehicle', label: 'RF-DETR Medium', available: false },
-  ],
-  tracker: [
-    { value: '', label: 'Auto from selected mode', available: true },
-    { value: 'bytetrack', label: 'ByteTrack', available: true },
-    { value: 'botsort', label: 'BoT-SORT', available: true },
-    { value: 'tracktrack', label: 'TrackTrack', available: true },
-  ],
-  plate_detector: [
-    { value: '', label: 'Auto from selected mode', available: true },
-    { value: 'yolov8n_plate', label: 'YOLOv8n plate', available: true },
-    { value: 'openimagemodels_plate_384', label: 'OpenImageModels ONNX plate (384)', available: true },
-    { value: 'yolo11n_plate', label: 'YOLO11n plate', available: true },
-    { value: 'yolov8n_plate_trt', label: 'YOLOv8n plate TensorRT', available: false },
-  ],
-  ocr_engine: [
-    { value: '', label: 'Auto from selected mode', available: true },
-    { value: 'easyocr', label: 'EasyOCR', available: true },
-    { value: 'paddleocr', label: 'PaddleOCR', available: false },
-    { value: 'lprnet', label: 'LPRNet ONNX', available: false },
-    { value: 'fastalpr', label: 'FastALPR target', available: false },
-  ],
-}
+const MANUAL_OPTIONS = MANUAL_PIPELINE_OPTIONS
 
 export default function CamerasPage() {
   const { t } = useTranslation()
@@ -85,6 +55,7 @@ export default function CamerasPage() {
   const [loading, setLoading] = useState(false)
   const [testing, setTesting] = useState<number | null>(null)
   const [manualOptions, setManualOptions] = useState(MANUAL_OPTIONS)
+  const [showModeGuide, setShowModeGuide] = useState(true)
   const sourceUrlRequired = !editing || form.source_type !== (editing.source_type || 'rtsp')
 
   const load = async () => {
@@ -98,22 +69,35 @@ export default function CamerasPage() {
     load()
     api.get('/health/ai-modes').then(({ data }) => {
       const groups: Record<string, any[]> = {
-        vehicle_detector: data.manual_options?.vehicle_detectors || [],
+        object_detector: data.manual_options?.object_detectors || [],
+        verifier_detector: data.manual_options?.verifier_detectors || [],
         tracker: data.manual_options?.trackers || [],
-        plate_detector: data.manual_options?.plate_detectors || [],
-        ocr_engine: data.manual_options?.ocr_engines || [],
       }
       setManualOptions(Object.fromEntries(Object.entries(MANUAL_OPTIONS).map(([key, options]) => [key, options.map((option) => {
         if (!option.value) return option
-        const match = groups[key]?.find((entry) => entry.name === option.value || (option.value === 'lprnet' && String(entry.name).startsWith('lprnet')))
+        const match = groups[key]?.find((entry) => entry.name === option.value)
         return { ...option, available: Boolean(match?.available) }
       })])) as typeof MANUAL_OPTIONS)
     }).catch(() => {})
   }, [])
 
-  const openAdd = () => { setEditing(null); setForm({ ...EMPTY_FORM }); setShowModal(true) }
+  const updateAiMode = (ai_mode: AIMode) => {
+    setForm((current) => {
+      const nextConfig = { ...current.pipeline_config }
+      if (ai_mode === 'hybrid') {
+        if (!String(nextConfig.object_detector || '').startsWith('yolo')) {
+          nextConfig.object_detector = 'yolo11s_object'
+        }
+        nextConfig.verifier_detector = nextConfig.verifier_detector || 'rfdetr_medium_object'
+      }
+      return { ...current, ai_mode, pipeline_mode: 'manual', pipeline_config: nextConfig }
+    })
+  }
+
+  const openAdd = () => { setEditing(null); setForm({ ...EMPTY_FORM }); setShowModeGuide(true); setShowModal(true) }
   const openEdit = (cam: Camera) => {
     setEditing(cam)
+    setShowModeGuide(true)
     setForm({
       name: cam.name,
       rtsp_url: '',
@@ -121,7 +105,7 @@ export default function CamerasPage() {
       snapshot_interval_seconds: cam.snapshot_interval_seconds || 1,
       location: cam.location || '',
       ai_mode: cam.ai_mode,
-      pipeline_mode: cam.pipeline_mode || 'automatic',
+      pipeline_mode: 'manual',
       pipeline_config: {
         ...EMPTY_FORM.pipeline_config,
         ...(cam.pipeline_config || {}),
@@ -144,6 +128,9 @@ export default function CamerasPage() {
     try {
       const payload = {
         ...form,
+        project_id: null,
+        pipeline_id: null,
+        task_profile: 'aerial_small_objects',
         pipeline_config: form.pipeline_config,
       }
       if (editing) {
@@ -260,59 +247,76 @@ export default function CamerasPage() {
         {/* Modal */}
         {showModal && (
           <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4">
-            <div className="bg-card border border-border rounded-2xl w-full max-w-5xl shadow-2xl max-h-[92vh] overflow-y-auto">
-              <div className="flex items-center justify-between p-6 border-b border-border">
+            <div className="flex max-h-[92vh] w-full max-w-[min(96vw,1500px)] flex-col overflow-hidden rounded-2xl border border-border bg-card shadow-2xl">
+              <div className="flex shrink-0 items-center justify-between gap-4 border-b border-border p-5">
                 <h2 className="font-semibold text-foreground">{editing ? t('Edit Camera') : t('Add Camera')}</h2>
-                <button onClick={() => setShowModal(false)} className="text-muted-foreground hover:text-foreground" aria-label={t('Close')}>✕</button>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setShowModeGuide((current) => !current)}
+                    className="rounded-lg border border-border bg-muted/30 px-3 py-2 text-xs font-medium text-foreground hover:bg-muted"
+                  >
+                    {showModeGuide ? t('Hide mode explanation') : t('Show how this mode works')}
+                  </button>
+                  <button onClick={() => setShowModal(false)} className="text-muted-foreground hover:text-foreground" aria-label={t('Close')}><X className="h-5 w-5" /></button>
+                </div>
               </div>
-              <div className="grid lg:grid-cols-[minmax(0,1fr)_minmax(390px,0.95fr)]">
-              <div className="p-6 space-y-4">
-                {[
-                  { label: 'Name', key: 'name', placeholder: 'Entrance Camera' },
-                  { label: 'Location', key: 'location', placeholder: 'Gate 1, North Entrance' },
-                ].map(({ label, key, placeholder }) => (
-                  <div key={key}>
-                    <label className="block text-sm font-medium text-muted-foreground mb-1">{t(label)}{key === 'rtsp_url' && editing ? t(' (leave blank to keep)') : ''}</label>
+              <div className={`grid min-h-0 flex-1 overflow-hidden ${showModeGuide ? 'lg:grid-cols-[minmax(0,1fr)_380px] xl:grid-cols-[minmax(0,1fr)_420px]' : 'grid-cols-1'}`}>
+              <div className="min-h-0 space-y-4 overflow-y-auto p-5 lg:p-6">
+                <div className="grid gap-3 xl:grid-cols-2">
+                  {[
+                    { label: 'Name', key: 'name', placeholder: 'Drone camera' },
+                    { label: 'Location', key: 'location', placeholder: 'Flight area or ground station' },
+                  ].map(({ label, key, placeholder }) => (
+                    <div key={key}>
+                      <label className="block text-sm font-medium text-muted-foreground mb-1">{t(label)}{key === 'rtsp_url' && editing ? t(' (leave blank to keep)') : ''}</label>
+                      <input
+                        value={(form as any)[key]}
+                        onChange={(e) => setForm({ ...form, [key]: e.target.value })}
+                        placeholder={t(placeholder)}
+                        className="w-full px-3 py-2 bg-background border border-input rounded-lg text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-ring"
+                      />
+                    </div>
+                  ))}
+                </div>
+
+                <div className="grid gap-3 xl:grid-cols-[minmax(220px,0.8fr)_minmax(0,1.2fr)]">
+                  <div>
+                    <label className="block text-sm font-medium text-muted-foreground mb-1">{t('Source Type')}</label>
+                    <select
+                      value={form.source_type}
+                      onChange={(e) => setForm({ ...form, source_type: e.target.value as CameraSourceType })}
+                      className="w-full px-3 py-2 bg-background border border-input rounded-lg text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-ring"
+                    >
+                      {SOURCE_TYPES.map((source) => (
+                        <option key={source.value} value={source.value}>{t(source.label)} - {t(source.desc)}</option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="block text-sm font-medium text-muted-foreground mb-1">
+                      {t('Source URL')}{editing ? t(' (leave blank to keep)') : ''}
+                    </label>
                     <input
-                      value={(form as any)[key]}
-                      onChange={(e) => setForm({ ...form, [key]: e.target.value })}
-                      placeholder={t(placeholder)}
+                      value={form.rtsp_url}
+                      onChange={(e) => setForm({ ...form, rtsp_url: e.target.value })}
+                      placeholder={
+                        form.source_type === 'usb'
+                          ? 'usb://0'
+                          : form.source_type === 'drone'
+                            ? 'rtsp://drone-or-ground-station/stream'
+                        : form.source_type === 'rtsp'
+                          ? 'rtsp://user:pass@192.168.1.100/stream'
+                          : form.source_type === 'hls'
+                            ? 'https://example.com/live/stream.m3u8'
+                            : form.source_type === 'mjpeg'
+                              ? 'https://example.com/camera/video.mjpg'
+                              : 'https://example.com/camera/latest.jpg'
+                      }
                       className="w-full px-3 py-2 bg-background border border-input rounded-lg text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-ring"
                     />
                   </div>
-                ))}
-
-                <div>
-                  <label className="block text-sm font-medium text-muted-foreground mb-1">{t('Source Type')}</label>
-                  <select
-                    value={form.source_type}
-                    onChange={(e) => setForm({ ...form, source_type: e.target.value as CameraSourceType })}
-                    className="w-full px-3 py-2 bg-background border border-input rounded-lg text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-ring"
-                  >
-                    {SOURCE_TYPES.map((source) => (
-                      <option key={source.value} value={source.value}>{t(source.label)} — {t(source.desc)}</option>
-                    ))}
-                  </select>
-                </div>
-
-                <div>
-                  <label className="block text-sm font-medium text-muted-foreground mb-1">
-                    {t('Source URL')}{editing ? t(' (leave blank to keep)') : ''}
-                  </label>
-                  <input
-                    value={form.rtsp_url}
-                    onChange={(e) => setForm({ ...form, rtsp_url: e.target.value })}
-                    placeholder={
-                      form.source_type === 'rtsp'
-                        ? 'rtsp://user:pass@192.168.1.100/stream'
-                        : form.source_type === 'hls'
-                          ? 'https://example.com/live/stream.m3u8'
-                          : form.source_type === 'mjpeg'
-                            ? 'https://example.com/camera/video.mjpg'
-                            : 'https://example.com/camera/latest.jpg'
-                    }
-                    className="w-full px-3 py-2 bg-background border border-input rounded-lg text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-ring"
-                  />
                 </div>
 
                 {form.source_type === 'jpeg' && (
@@ -330,74 +334,62 @@ export default function CamerasPage() {
                   </div>
                 )}
 
+                <div className="grid gap-3 xl:grid-cols-2">
                 <div>
-                  <label className="block text-sm font-medium text-muted-foreground mb-1">{t('AI Mode')}</label>
-                  <select value={form.ai_mode} onChange={(e) => setForm({ ...form, ai_mode: e.target.value as AIMode })}
+                  <label className="block text-sm font-medium text-muted-foreground mb-1">{t('Processing mode')}</label>
+                  <select value={form.ai_mode} onChange={(e) => updateAiMode(e.target.value as AIMode)}
                     className="w-full px-3 py-2 bg-background border border-input rounded-lg text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-ring">
-                    {AI_MODE_OPTIONS.map((mode) => <option key={mode.id} value={mode.id}>{t(mode.label)} — {t(mode.eyebrow)}</option>)}
+                    {AI_MODE_OPTIONS.map((mode) => <option key={mode.id} value={mode.id}>{t(mode.label)}</option>)}
                   </select>
                 </div>
-
-                <div>
-                  <label className="block text-sm font-medium text-muted-foreground mb-2">{t('Pipeline selection')}</label>
-                  <div className="grid grid-cols-2 gap-2 rounded-lg border border-border bg-background/50 p-1">
-                    {(['automatic', 'manual'] as PipelineMode[]).map((mode) => (
-                      <button
-                        key={mode}
-                        type="button"
-                        onClick={() => setForm({ ...form, pipeline_mode: mode })}
-                        className={`rounded-md px-3 py-2 text-xs font-medium transition-colors ${form.pipeline_mode === mode ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:text-foreground'}`}
-                      >
-                        {t(mode === 'automatic' ? 'Automatic' : 'Manual')}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
-                {form.pipeline_mode === 'manual' && (
-                  <div className="space-y-3 rounded-xl border border-border bg-muted/20 p-4">
-                    <div>
-                      <p className="text-sm font-medium text-foreground">{t('Manual pipeline')}</p>
-                      <p className="mt-1 text-xs leading-5 text-muted-foreground">
-                        {t('Only initialized components are selectable. TensorRT choices appear after compatible engines are built on an NVIDIA runtime.')}
-                      </p>
-                    </div>
-                    {([
-                      ['vehicle_detector', 'Vehicle detector'],
-                      ['tracker', 'Tracker'],
-                      ['plate_detector', 'Plate detector'],
-                      ['ocr_engine', 'OCR Engine'],
-                    ] as const).map(([key, label]) => (
-                      <div key={key}>
-                        <label className="mb-1 block text-xs font-medium text-muted-foreground">{t(label)}</label>
-                        <select
-                          value={(form.pipeline_config as any)[key] || ''}
-                          onChange={(e) => setForm({
-                            ...form,
-                            pipeline_config: { ...form.pipeline_config, [key]: e.target.value },
-                          })}
-                          className="w-full px-3 py-2 bg-background border border-input rounded-lg text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-ring"
-                        >
-                          {(manualOptions as any)[key].filter((option: any) => option.available).map((option: any) => (
-                            <option key={option.value} value={option.value}>
-                              {t(option.label)}
-                            </option>
-                          ))}
-                        </select>
-                      </div>
-                    ))}
-                    <p className="text-xs text-muted-foreground">{t('Temporal voting and composite confidence scoring are always active. Embedding-based Vehicle ReID is not exposed until a validated model is integrated.')}</p>
-                  </div>
-                )}
-
-                <LocalRecognitionSettings value={form.pipeline_config} onChange={(pipeline_config) => setForm({ ...form, pipeline_config: pipeline_config as typeof form.pipeline_config })} />
-
-                <div className="grid grid-cols-2 gap-3">
                   <div>
                     <label className="block text-sm font-medium text-muted-foreground mb-1">{t('Max FPS')}</label>
                     <input type="number" min={1} max={60} value={form.max_fps} onChange={(e) => setForm({ ...form, max_fps: Number(e.target.value) })}
                       className="w-full px-3 py-2 bg-background border border-input rounded-lg text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-ring" />
                   </div>
+                </div>
+
+                <div className="space-y-3 rounded-xl border border-border bg-muted/20 p-4">
+                  <p className="text-xs leading-5 text-muted-foreground">
+                    {t(form.ai_mode === 'hybrid'
+                      ? 'Double verification uses YOLO as the first detector and RF-DETR as the verifier.'
+                      : 'Standard mode runs one selected detector before tracking.')}
+                  </p>
+                  <div className={`grid gap-3 ${form.ai_mode === 'hybrid' ? 'xl:grid-cols-3' : 'xl:grid-cols-2'}`}>
+                    <ManualSelect
+                      label="Object detector"
+                      options={(manualOptions as any).object_detector.filter((option: ManualPipelineOption) => form.ai_mode !== 'hybrid' || !option.value || option.value.startsWith('yolo'))}
+                      value={(form.pipeline_config as any).object_detector || ''}
+                      onChange={(next) => setForm({
+                        ...form,
+                        pipeline_config: { ...form.pipeline_config, object_detector: next },
+                      })}
+                    />
+                    {form.ai_mode === 'hybrid' && (
+                      <ManualSelect
+                        label="Verifier detector"
+                        options={(manualOptions as any).verifier_detector}
+                        value={(form.pipeline_config as any).verifier_detector || 'rfdetr_medium_object'}
+                        onChange={(next) => setForm({
+                          ...form,
+                          pipeline_config: { ...form.pipeline_config, verifier_detector: next },
+                        })}
+                      />
+                    )}
+                    <ManualSelect
+                      label="Tracker"
+                      options={(manualOptions as any).tracker}
+                      value={(form.pipeline_config as any).tracker || ''}
+                      onChange={(next) => setForm({
+                        ...form,
+                        pipeline_config: { ...form.pipeline_config, tracker: next },
+                      })}
+                    />
+                  </div>
+                  </div>
+                <AerialSourceSettings value={form.pipeline_config} onChange={(pipeline_config) => setForm({ ...form, pipeline_config: pipeline_config as typeof form.pipeline_config })} />
+
+                <div className="grid grid-cols-2 gap-3">
                   <div>
                     <label className="block text-sm font-medium text-muted-foreground mb-1">{t('Priority (1-10)')}</label>
                     <input type="number" min={1} max={10} value={form.priority} onChange={(e) => setForm({ ...form, priority: Number(e.target.value) })}
@@ -406,7 +398,7 @@ export default function CamerasPage() {
                 </div>
 
                 <div className="flex gap-4">
-                  {[{ key: 'save_crops', label: 'Save crops' }, { key: 'anonymization', label: 'Anonymize plates/faces' }].map(({ key, label }) => (
+                  {[{ key: 'save_crops', label: 'Save object crops' }].map(({ key, label }) => (
                     <label key={key} className="flex items-center gap-2 cursor-pointer">
                       <input type="checkbox" checked={(form as any)[key]} onChange={(e) => setForm({ ...form, [key]: e.target.checked })} className="rounded" />
                       <span className="text-sm text-muted-foreground">{t(label)}</span>
@@ -424,19 +416,19 @@ export default function CamerasPage() {
                       <label className="flex items-center gap-2 text-sm text-muted-foreground"><input type="checkbox" checked={form.gemini_verify_predictions} onChange={(e) => setForm({ ...form, gemini_verify_predictions: e.target.checked })} />{t('Verify model detections with Gemini')}</label>
                       <label className="flex items-center gap-2 text-sm text-muted-foreground"><input type="checkbox" checked={form.gemini_collect_training} onChange={(e) => setForm({ ...form, gemini_collect_training: e.target.checked })} />{t('Create mask candidates for training')}</label>
                       <div className="grid grid-cols-2 gap-3">
-                        <label className="text-xs text-muted-foreground">{t('Minimum interval, seconds')}<input type="number" min={5} max={3600} value={form.gemini_sample_interval_seconds} onChange={(e) => setForm({ ...form, gemini_sample_interval_seconds: Number(e.target.value) })} className="mt-1 w-full px-3 py-2 bg-background border border-input rounded-lg text-sm" /></label>
+                        <label className="text-xs text-muted-foreground">{t('Send one selected frame every N seconds')}<input type="number" min={5} max={3600} value={form.gemini_sample_interval_seconds} onChange={(e) => setForm({ ...form, gemini_sample_interval_seconds: Number(e.target.value) })} className="mt-1 w-full px-3 py-2 bg-background border border-input rounded-lg text-sm" /></label>
                         <label className="text-xs text-muted-foreground">{t('Maximum candidates per run')}<input type="number" min={1} max={500} value={form.gemini_max_candidates_per_run} onChange={(e) => setForm({ ...form, gemini_max_candidates_per_run: Number(e.target.value) })} className="mt-1 w-full px-3 py-2 bg-background border border-input rounded-lg text-sm" /></label>
                       </div>
-                      <p className="text-xs text-amber-400">{t('Frames may contain license plates or people. Enable this only when external processing is permitted.')}</p>
+                      <p className="text-xs text-amber-400">{t('Frames may contain people or sensitive locations. Enable external processing only when permitted.')}</p>
                     </div>
                   )}
                 </div>
               </div>
-              <div className="border-t border-border lg:border-l lg:border-t-0">
-                <AiModeExplainer mode={form.ai_mode} />
+              {showModeGuide && <div className="min-h-0 border-t border-border lg:border-l lg:border-t-0">
+                <AiModeExplainer mode={form.ai_mode} pipelineMode={form.pipeline_mode} pipelineConfig={form.pipeline_config} />
+              </div>}
               </div>
-              </div>
-              <div className="flex gap-3 p-6 border-t border-border">
+              <div className="flex shrink-0 gap-3 border-t border-border p-5">
                 <button onClick={() => setShowModal(false)} className="flex-1 py-2 border border-border rounded-lg text-sm text-muted-foreground hover:text-foreground">{t('Cancel')}</button>
                 <button onClick={handleSave} disabled={loading || (sourceUrlRequired && !form.rtsp_url)} className="flex-1 py-2 bg-primary text-primary-foreground rounded-lg text-sm font-medium hover:bg-primary/90 disabled:opacity-50">
                   {loading ? t('Saving...') : t('Save')}
@@ -447,5 +439,37 @@ export default function CamerasPage() {
         )}
       </div>
     </AppShell>
+  )
+}
+
+function ManualSelect({
+  label,
+  options,
+  value,
+  onChange,
+}: {
+  label: string
+  options: ManualPipelineOption[]
+  value: string
+  onChange: (value: string) => void
+}) {
+  const { t } = useTranslation()
+  const selected = options.find((option) => option.value === value) || options[0]
+  return (
+    <div>
+      <label className="mb-1 block text-xs font-medium text-muted-foreground">{t(label)}</label>
+      <select
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        className="w-full px-3 py-2 bg-background border border-input rounded-lg text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-ring"
+      >
+        {options.map((option) => (
+          <option key={option.value} value={option.value} disabled={!option.available}>
+            {t(option.label)} - {t(option.family)}{option.available ? '' : ` - ${t('not installed')}`}
+          </option>
+        ))}
+      </select>
+      <p className="mt-1 text-[11px] leading-4 text-muted-foreground">{t(selected.detail)}</p>
+    </div>
   )
 }

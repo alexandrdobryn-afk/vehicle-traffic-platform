@@ -45,67 +45,41 @@ def upgrade() -> None:
     )
     op.create_index('ix_users_email', 'users', ['email'])
 
-    op.create_table('watchlist',
+    op.create_table('object_tracks',
         sa.Column('id', sa.Integer(), nullable=False),
-        sa.Column('plate_number', sa.String(20), nullable=False),
-        sa.Column('description', sa.Text(), nullable=True),
-        sa.Column('alert_channels', postgresql.JSON(), server_default='["frontend"]'),
-        sa.Column('is_active', sa.Boolean(), server_default='true'),
-        sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()')),
-        sa.Column('updated_at', sa.DateTime(timezone=True), server_default=sa.text('now()')),
-        sa.PrimaryKeyConstraint('id')
-    )
-    op.create_index('ix_watchlist_plate_number', 'watchlist', ['plate_number'])
-
-    op.create_table('vehicle_tracks',
-        sa.Column('id', sa.Integer(), nullable=False),
-        sa.Column('camera_id', sa.Integer(), nullable=False),
+        sa.Column('source_id', sa.Integer(), nullable=False),
+        sa.Column('processing_run_id', sa.String(64), nullable=False, server_default='default'),
         sa.Column('track_id', sa.Integer(), nullable=False),
-        sa.Column('vehicle_class', sa.String(50), nullable=False),
-        sa.Column('final_plate', sa.String(20), nullable=True),
-        sa.Column('plate_status', sa.String(30), server_default='searching'),
-        sa.Column('final_plate_confidence', sa.Float(), server_default='0.0'),
-        sa.Column('color', sa.String(30), server_default='unknown'),
-        sa.Column('color_confidence', sa.Float(), server_default='0.0'),
+        sa.Column('object_class', sa.String(100), nullable=False),
+        sa.Column('confidence', sa.Float(), server_default='0.0'),
+        sa.Column('trajectory', postgresql.JSON(), server_default='[]'),
+        sa.Column('speed_pixels_per_second', sa.Float(), server_default='0.0'),
+        sa.Column('direction_degrees', sa.Float(), nullable=True),
+        sa.Column('state', sa.String(30), server_default='active'),
+        sa.Column('attributes', postgresql.JSON(), server_default='{}'),
+        sa.Column('best_crop_path', sa.String(500), nullable=True),
         sa.Column('first_seen', sa.DateTime(timezone=True), server_default=sa.text('now()')),
         sa.Column('last_seen', sa.DateTime(timezone=True), server_default=sa.text('now()')),
         sa.Column('duration_seconds', sa.Float(), server_default='0.0'),
-        sa.Column('best_vehicle_crop_path', sa.String(500), nullable=True),
-        sa.Column('best_plate_crop_path', sa.String(500), nullable=True),
         sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()')),
         sa.Column('updated_at', sa.DateTime(timezone=True), server_default=sa.text('now()')),
-        sa.ForeignKeyConstraint(['camera_id'], ['cameras.id'], ondelete='CASCADE'),
+        sa.ForeignKeyConstraint(['source_id'], ['cameras.id'], ondelete='CASCADE'),
         sa.PrimaryKeyConstraint('id')
     )
-    op.create_index('ix_vehicle_tracks_camera_id', 'vehicle_tracks', ['camera_id'])
-    op.create_index('ix_vehicle_tracks_final_plate', 'vehicle_tracks', ['final_plate'])
-
-    op.create_table('plate_candidates',
-        sa.Column('id', sa.Integer(), nullable=False),
-        sa.Column('vehicle_track_id', sa.Integer(), nullable=False),
-        sa.Column('plate_text', sa.String(20), nullable=False),
-        sa.Column('raw_ocr_text', sa.String(100), nullable=True),
-        sa.Column('confidence', sa.Float(), server_default='0.0'),
-        sa.Column('regex_valid', sa.Boolean(), server_default='false'),
-        sa.Column('regex_score', sa.Float(), server_default='0.0'),
-        sa.Column('image_quality_score', sa.Float(), server_default='0.0'),
-        sa.Column('frame_timestamp', sa.DateTime(timezone=True), server_default=sa.text('now()')),
-        sa.Column('crop_path', sa.String(500), nullable=True),
-        sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()')),
-        sa.ForeignKeyConstraint(['vehicle_track_id'], ['vehicle_tracks.id'], ondelete='CASCADE'),
-        sa.PrimaryKeyConstraint('id')
-    )
+    op.create_index('ix_object_tracks_source_id', 'object_tracks', ['source_id'])
+    op.create_index('ix_object_tracks_object_class', 'object_tracks', ['object_class'])
+    op.create_index('ix_object_tracks_processing_run', 'object_tracks', ['source_id', 'processing_run_id'])
 
     op.create_table('events',
         sa.Column('id', sa.Integer(), nullable=False),
         sa.Column('camera_id', sa.Integer(), nullable=False),
-        sa.Column('vehicle_track_id', sa.Integer(), nullable=True),
+        sa.Column('object_track_id', sa.Integer(), nullable=True),
         sa.Column('event_type', sa.String(50), nullable=False),
         sa.Column('payload_json', postgresql.JSON(), nullable=True),
         sa.Column('frame_path', sa.String(500), nullable=True),
         sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()')),
         sa.ForeignKeyConstraint(['camera_id'], ['cameras.id'], ondelete='CASCADE'),
-        sa.ForeignKeyConstraint(['vehicle_track_id'], ['vehicle_tracks.id'], ondelete='SET NULL'),
+        sa.ForeignKeyConstraint(['object_track_id'], ['object_tracks.id'], ondelete='SET NULL'),
         sa.PrimaryKeyConstraint('id')
     )
     op.create_index('ix_events_camera_id', 'events', ['camera_id'])
@@ -136,8 +110,6 @@ def downgrade() -> None:
     op.drop_table('app_settings')
     op.drop_table('system_logs')
     op.drop_table('events')
-    op.drop_table('plate_candidates')
-    op.drop_table('vehicle_tracks')
-    op.drop_table('watchlist')
+    op.drop_table('object_tracks')
     op.drop_table('users')
     op.drop_table('cameras')

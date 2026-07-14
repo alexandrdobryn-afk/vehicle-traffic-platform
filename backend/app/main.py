@@ -11,10 +11,17 @@ from fastapi.staticfiles import StaticFiles
 from app.config import settings
 from app.models.database import init_db, get_db, User, AppSettings, Camera, engine
 from app.api.routers import (
-    auth_router, cameras_router, videos_router, streams_router, tracks_router,
-    events_router, watchlist_router, analytics_router,
+    auth_router, cameras_router, videos_router, streams_router,
+    events_router, analytics_router,
     settings_router, health_router,
     gemini_router,
+)
+from app.api.platform_routers import (
+    evaluation_router,
+    modules_router,
+    objects_router,
+    pipelines_router,
+    projects_router,
 )
 from app.services.camera_manager import camera_manager
 from app.services.websocket_service import websocket_manager
@@ -22,6 +29,7 @@ from app.services.event_service import EventService
 from app.services.gemini_training_service import gemini_training_service
 from app.utils.auth import hash_password, decode_token
 from app.schemas.schemas import AppSettingsSchema
+from app.defaults import default_source_pipeline_config
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import sessionmaker
 
@@ -46,10 +54,10 @@ async def lifespan(app: FastAPI):
             raise RuntimeError("Production requires a unique SECRET_KEY of at least 32 characters")
         if settings.INITIAL_ADMIN_PASSWORD == "admin123":
             raise RuntimeError("Production requires a unique INITIAL_ADMIN_PASSWORD")
-        if "vtp_pass" in settings.DATABASE_URL:
+        if "bevp_pass" in settings.DATABASE_URL:
             raise RuntimeError("Production requires a unique PostgreSQL password")
 
-    logger.info("🚀 Starting Vehicle Traffic Platform...")
+    logger.info("Starting Bird's-Eye Vision Platform...")
 
     # Create storage directories
     for path in [settings.STORAGE_PATH, settings.CROPS_PATH, settings.FRAMES_PATH, settings.VIDEOS_PATH]:
@@ -59,7 +67,7 @@ async def lifespan(app: FastAPI):
     await init_db()
     await _migrate_global_recognition_settings()
     camera_manager.set_source_finished_callback(_mark_recorded_source_finished)
-    logger.info("✅ Database initialized")
+    logger.info("вњ… Database initialized")
 
     # Seed default admin user if not exists
     await _seed_admin()
@@ -69,14 +77,15 @@ async def lifespan(app: FastAPI):
         redis_client = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
         await redis_client.ping()
         camera_manager.set_redis(redis_client)
-        logger.info("✅ Redis connected")
+        logger.info("вњ… Redis connected")
     except Exception as e:
-        logger.warning(f"⚠️  Redis not available: {e}. Continuing without Redis.")
+        logger.warning(f"вљ пёЏ  Redis not available: {e}. Continuing without Redis.")
         redis_client = None
 
     # Start event service
     from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
     from sqlalchemy.orm import sessionmaker
+    from app.services.runtime_service import start_runtime_monitor, wait_for_runtime_probe
 
     engine_for_events = create_async_engine(settings.DATABASE_URL, echo=False)
     AsyncSessionForEvents = sessionmaker(
@@ -90,17 +99,23 @@ async def lifespan(app: FastAPI):
         redis_client=redis_client,
     )
     await event_service.start()
-    logger.info("✅ Event service started")
+    logger.info("вњ… Event service started")
+
+    # Runtime probing runs in a background monitor. HTTP requests read its
+    # cached snapshot instead of initializing CUDA/ONNX in the request path.
+    start_runtime_monitor()
+    await asyncio.to_thread(wait_for_runtime_probe, 10)
+    logger.info("Runtime monitor started")
 
     # Auto-start cameras that were previously active
     await _restore_cameras()
 
-    logger.info("✅ Platform ready")
+    logger.info("вњ… Platform ready")
 
     yield
 
     # Shutdown
-    logger.info("🛑 Shutting down...")
+    logger.info("рџ›‘ Shutting down...")
     if event_service:
         await event_service.stop()
     await gemini_training_service.shutdown()
@@ -111,9 +126,9 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Vehicle Traffic Platform",
-    version="1.0.0",
-    description="Professional vehicle traffic analysis platform",
+    title="Bird's-Eye Vision Platform",
+    version="2.0.0",
+    description="Modular computer-vision platform for aerial and fixed-camera analysis",
     lifespan=lifespan,
 )
 
@@ -121,6 +136,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.CORS_ORIGINS,
+    allow_origin_regex=r"http://172\.\d+\.\d+\.\d+:3100" if settings.APP_ENV.lower() == "development" else None,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -131,19 +147,22 @@ app.include_router(auth_router)
 app.include_router(cameras_router)
 app.include_router(videos_router)
 app.include_router(streams_router)
-app.include_router(tracks_router)
 app.include_router(events_router)
-app.include_router(watchlist_router)
 app.include_router(analytics_router)
 app.include_router(settings_router)
 app.include_router(gemini_router)
 app.include_router(health_router)
+app.include_router(objects_router)
+app.include_router(modules_router)
+app.include_router(projects_router)
+app.include_router(pipelines_router)
+app.include_router(evaluation_router)
 
 # Static files for crops/frames
 app.mount("/storage", StaticFiles(directory=settings.STORAGE_PATH), name="storage")
 
 
-# ═══ WEBSOCKET ════════════════════════════════════════════════════
+# === WEBSOCKET ====================================================
 @app.websocket("/ws/live/{camera_id}")
 async def websocket_endpoint(
     websocket: WebSocket,
@@ -170,7 +189,7 @@ async def websocket_endpoint(
         await websocket_manager.disconnect(camera_id, websocket)
 
 
-# ═══ STARTUP HELPERS ══════════════════════════════════════════════
+# === STARTUP HELPERS ==============================================
 async def _seed_admin():
     """Create default admin if no users exist."""
     from sqlalchemy import select
@@ -207,14 +226,12 @@ async def _mark_recorded_source_finished(camera_id: int, status: str):
 
 
 async def _migrate_global_recognition_settings():
-    """Materialize recognition defaults per source and copy legacy values once."""
+    """Materialize source-local object-analysis defaults."""
     from sqlalchemy import select
 
     source_keys = {
-        "vehicle_confidence_threshold", "plate_confidence_threshold",
-        "ocr_threshold", "plate_regex_profile", "input_resolution",
-        "ocr_voting_window", "track_missing_grace_frames",
-        "minimum_plate_width", "minimum_plate_height",
+        "object_confidence_threshold",
+        "track_missing_grace_frames",
     }
     AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     async with AsyncSessionLocal() as db:
@@ -222,7 +239,7 @@ async def _migrate_global_recognition_settings():
         settings_row = result.scalar_one_or_none()
         result = await db.execute(select(Camera))
         changed = 0
-        defaults = AppSettingsSchema().model_dump()
+        defaults = default_source_pipeline_config()
         legacy = settings_row.value if settings_row and settings_row.value else {}
         for camera in result.scalars().all():
             config = dict(camera.pipeline_config or {})
@@ -236,7 +253,7 @@ async def _migrate_global_recognition_settings():
                 changed += 1
         if changed:
             await db.commit()
-            logger.info("Migrated legacy global recognition settings into %s sources", changed)
+            logger.info("Materialized source-local object settings into %s sources", changed)
 
 
 async def _restore_cameras():
@@ -260,12 +277,10 @@ async def _restore_cameras():
         for cam in cameras:
             try:
                 url = cam.source_file_path if cam.source_type == "file" else decrypt_url(cam.rtsp_url_encrypted)
-                defaults = AppSettingsSchema().model_dump()
+                defaults = default_source_pipeline_config()
                 source_keys = {
-                    "vehicle_confidence_threshold", "plate_confidence_threshold",
-                    "ocr_threshold", "plate_regex_profile", "input_resolution",
-                    "ocr_voting_window", "track_missing_grace_frames",
-                    "minimum_plate_width", "minimum_plate_height",
+                    "object_confidence_threshold",
+                    "track_missing_grace_frames",
                 }
                 config = cam.pipeline_config or {}
                 runtime_settings = {key: config.get(key, defaults[key]) for key in source_keys}
@@ -274,6 +289,9 @@ async def _restore_cameras():
                     runtime_settings["frame_skip"] = frame_skip
                 runtime_settings["pipeline_mode"] = cam.pipeline_mode or "automatic"
                 runtime_settings["pipeline_config"] = config
+                runtime_settings["task_profile"] = cam.task_profile or "aerial_small_objects"
+                runtime_settings["target_classes"] = config.get("target_classes", [])
+                runtime_settings["aerial"] = config.get("aerial", {})
                 runtime_settings["save_crops"] = bool(cam.save_crops)
                 runtime_settings["anonymization_mode"] = bool(cam.anonymization)
                 for key in (
@@ -290,6 +308,6 @@ async def _restore_cameras():
                     source_type=cam.source_type,
                     snapshot_interval_seconds=cam.snapshot_interval_seconds,
                 )
-                logger.info(f"✅ Camera {cam.id} ({cam.name}) auto-started")
+                logger.info(f"вњ… Camera {cam.id} ({cam.name}) auto-started")
             except Exception as e:
-                logger.warning(f"⚠️  Failed to auto-start camera {cam.id}: {e}")
+                logger.warning(f"вљ пёЏ  Failed to auto-start camera {cam.id}: {e}")

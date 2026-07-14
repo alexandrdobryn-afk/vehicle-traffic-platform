@@ -29,6 +29,7 @@ class CameraManager:
         self._source_finished_callback: Optional[Callable[[int, str], Awaitable[None]]] = None
         self._frame_analysis_callback: Optional[Callable[..., Awaitable[None]]] = None
         self._preview_encode_counts: Dict[int, int] = {}
+        self._last_start_errors: Dict[int, str] = {}
 
     def set_redis(self, redis_client):
         self._redis = redis_client
@@ -52,7 +53,10 @@ class CameraManager:
         async with self._lock:
             if camera_id in self._tasks and not self._tasks[camera_id].done():
                 logger.warning(f"Camera {camera_id} already running")
+                self._last_start_errors[camera_id] = "Source is already running"
                 return False
+
+            self._last_start_errors.pop(camera_id, None)
 
             # A completed file source leaves its final frame available for preview.
             # Starting it again replaces that finished runtime and begins at frame zero.
@@ -98,7 +102,8 @@ class CameraManager:
                 return True
 
             except Exception as e:
-                logger.error(f"Failed to start camera {camera_id}: {e}")
+                self._last_start_errors[camera_id] = str(e)
+                logger.error(f"Failed to start camera {camera_id}: {e}", exc_info=True)
                 return False
 
     async def stop_camera(self, camera_id: int) -> bool:
@@ -133,14 +138,15 @@ class CameraManager:
         """Main async loop — reads frames and runs inference."""
         capture = self._captures[camera_id]
         pipeline = self._pipelines[camera_id]
+        consecutive_errors = 0
 
         logger.info(f"[Loop cam={camera_id}] Processing loop started")
 
         while True:
             try:
-                frame = capture.get_frame()
+                packet = capture.get_frame_packet()
 
-                if frame is None:
+                if packet is None:
                     if capture.is_finished():
                         status = capture.completion_status()
                         if status == "completed":
@@ -159,6 +165,8 @@ class CameraManager:
                     await asyncio.sleep(0.02)
                     continue
 
+                frame, source_metadata = packet
+
                 source_frame = frame
                 analysis_frame = frame
                 if pipeline.input_resolution and frame.shape[1::-1] != pipeline.input_resolution:
@@ -172,7 +180,9 @@ class CameraManager:
                 metadata = await pipeline.process_frame(
                     analysis_frame,
                     source_frame=source_frame,
+                    source_metadata=source_metadata,
                 )
+                consecutive_errors = 0
 
                 if metadata:
                     if self._frame_analysis_callback:
@@ -200,7 +210,20 @@ class CameraManager:
                 logger.info(f"[Loop cam={camera_id}] Cancelled")
                 break
             except Exception as e:
-                logger.error(f"[Loop cam={camera_id}] Error: {e}")
+                consecutive_errors += 1
+                logger.error(f"[Loop cam={camera_id}] Error: {e}", exc_info=True)
+                if capture.source_type == "file" and consecutive_errors >= 3:
+                    await pipeline.finalize()
+                    await websocket_manager.broadcast(camera_id, {
+                        "type": "source_error",
+                        "camera_id": camera_id,
+                        "status": "error",
+                        "error": str(e),
+                    })
+                    if self._source_finished_callback:
+                        await self._source_finished_callback(camera_id, "error")
+                    logger.error("[Loop cam=%s] Recorded source failed after repeated pipeline errors", camera_id)
+                    break
                 await asyncio.sleep(0.1)
 
     # Separate latest frame store for MJPEG
@@ -288,6 +311,9 @@ class CameraManager:
 
     def get_capture(self, camera_id: int) -> Optional[VideoCaptureService]:
         return self._captures.get(camera_id)
+
+    def get_last_start_error(self, camera_id: int) -> Optional[str]:
+        return self._last_start_errors.get(camera_id)
 
     def get_pipeline(self, camera_id: int) -> Optional[InferencePipeline]:
         return self._pipelines.get(camera_id)

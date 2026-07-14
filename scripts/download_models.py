@@ -32,7 +32,7 @@ def sha256_file(path: Path) -> str:
 
 def download(url: str, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
-    request = urllib.request.Request(url, headers={"User-Agent": "VTP-model-manager/1.0"})
+    request = urllib.request.Request(url, headers={"User-Agent": "BEVP-model-manager/1.0"})
     temp_path: Path | None = None
     try:
         with urllib.request.urlopen(request, timeout=60) as response:

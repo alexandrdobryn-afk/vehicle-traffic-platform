@@ -10,26 +10,19 @@ import toast from 'react-hot-toast'
 import { useTranslation } from '@/lib/i18n'
 
 const MODEL_TYPES: { value: ModelType; label: string }[] = [
-  { value: 'vehicle_detector', label: 'Vehicle Detector' },
-  { value: 'plate_detector', label: 'Plate Detector' },
-  { value: 'vehicle_segmenter', label: 'Vehicle Segmenter' },
-  { value: 'plate_segmenter', label: 'Plate Segmenter' },
-  { value: 'ocr', label: 'OCR' },
-  { value: 'color_classifier', label: 'Color Classifier' },
+  { value: 'object_detector', label: 'Object Detector' },
+  { value: 'object_segmenter', label: 'Object Segmenter' },
+  { value: 'object_classifier', label: 'Object Classifier' },
 ]
 const ANN_TYPES: { value: AnnotationType; label: string }[] = [
   { value: 'bbox', label: 'Bounding Box' },
   { value: 'segmentation', label: 'Segmentation Mask' },
   { value: 'classification', label: 'Classification' },
-  { value: 'ocr', label: 'OCR Text' },
 ]
 const DEFAULT_CLASSES: Record<ModelType, string[]> = {
-  vehicle_detector: ['car', 'truck', 'bus', 'motorcycle', 'van'],
-  plate_detector: ['license_plate'],
-  vehicle_segmenter: ['car', 'truck', 'bus', 'motorcycle', 'van'],
-  plate_segmenter: ['license_plate'],
-  color_classifier: ['black', 'white', 'gray', 'silver', 'red', 'blue', 'green', 'yellow', 'orange', 'brown', 'beige'],
-  ocr: [],
+  object_detector: ['person', 'building', 'boat'],
+  object_segmenter: ['road', 'building', 'vegetation', 'water'],
+  object_classifier: ['class_a', 'class_b'],
 }
 
 export default function DatasetsPage() {
@@ -38,9 +31,9 @@ export default function DatasetsPage() {
   const [showModal, setShowModal] = useState(false)
   const [filter, setFilter] = useState('')
   const [form, setForm] = useState({
-    name: '', description: '', model_type: 'vehicle_detector' as ModelType,
+    name: '', description: '', model_type: 'object_detector' as ModelType,
     annotation_type: 'bbox' as AnnotationType,
-    classes: [...DEFAULT_CLASSES.vehicle_detector], tags: [] as string[],
+    classes: [...DEFAULT_CLASSES.object_detector], tags: [] as string[],
   })
   const [classInput, setClassInput] = useState('')
   const [loading, setLoading] = useState(false)
@@ -62,8 +55,8 @@ export default function DatasetsPage() {
       toast.success(t('Dataset created'))
       setShowModal(false)
       setForm({
-        name: '', description: '', model_type: 'vehicle_detector',
-        annotation_type: 'bbox', classes: [...DEFAULT_CLASSES.vehicle_detector], tags: [],
+        name: '', description: '', model_type: 'object_detector',
+        annotation_type: 'bbox', classes: [...DEFAULT_CLASSES.object_detector], tags: [],
       })
       load()
     } catch (e: any) { toast.error(e.response?.data?.detail || t('Error')) }
@@ -183,7 +176,7 @@ export default function DatasetsPage() {
                 <div>
                   <label className="block text-sm font-medium text-muted-foreground mb-1">{t('Name')}</label>
                   <input value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))}
-                    placeholder={t('UA Vehicles 2026')} className="w-full px-3 py-2 bg-background border border-input rounded-lg text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-ring" />
+                    placeholder={t('Aerial objects 2026')} className="w-full px-3 py-2 bg-background border border-input rounded-lg text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-ring" />
                 </div>
                 <div>
                   <label className="block text-sm font-medium text-muted-foreground mb-1">{t('Description')}</label>

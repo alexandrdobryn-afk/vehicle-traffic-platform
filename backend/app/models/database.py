@@ -9,10 +9,64 @@ class Base(DeclarativeBase):
     pass
 
 
+class Project(Base):
+    __tablename__ = "cv_projects"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(255), nullable=False, unique=True)
+    slug = Column(String(100), nullable=False, unique=True, index=True)
+    description = Column(Text, nullable=True)
+    task_profile = Column(String(50), nullable=False, default="generic_objects", server_default="generic_objects")
+    target_classes = Column(JSON, nullable=False, default=list)
+    status = Column(String(30), nullable=False, default="active", server_default="active")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now(), server_default=func.now())
+
+    sources = relationship("Camera", back_populates="project")
+    pipelines = relationship("PipelineDefinition", back_populates="project")
+
+
+class PipelineDefinition(Base):
+    __tablename__ = "cv_pipelines"
+
+    id = Column(Integer, primary_key=True, index=True)
+    project_id = Column(Integer, ForeignKey("cv_projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    name = Column(String(255), nullable=False)
+    description = Column(Text, nullable=True)
+    version = Column(Integer, nullable=False, default=1, server_default="1")
+    task_profile = Column(String(50), nullable=False, default="generic_objects", server_default="generic_objects")
+    config = Column(JSON, nullable=False, default=dict)
+    is_default = Column(Boolean, nullable=False, default=False, server_default="false")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now(), server_default=func.now())
+
+    project = relationship("Project", back_populates="pipelines")
+
+
+class EvaluationRun(Base):
+    __tablename__ = "cv_evaluation_runs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    project_id = Column(Integer, ForeignKey("cv_projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    name = Column(String(255), nullable=False)
+    task_type = Column(String(30), nullable=False)
+    model_name = Column(String(255), nullable=False)
+    dataset_ref = Column(String(500), nullable=False)
+    status = Column(String(30), nullable=False, default="pending", server_default="pending")
+    config = Column(JSON, nullable=False, default=dict)
+    metrics = Column(JSON, nullable=True)
+    error_message = Column(Text, nullable=True)
+    started_at = Column(DateTime(timezone=True), nullable=True)
+    finished_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
 class Camera(Base):
     __tablename__ = "cameras"
 
     id = Column(Integer, primary_key=True, index=True)
+    project_id = Column(Integer, ForeignKey("cv_projects.id", ondelete="SET NULL"), nullable=True, index=True)
+    pipeline_id = Column(Integer, ForeignKey("cv_pipelines.id", ondelete="SET NULL"), nullable=True, index=True)
     name = Column(String(255), nullable=False)
     rtsp_url_encrypted = Column(Text, nullable=False)
     source_type = Column(String(20), nullable=False, default="rtsp", server_default="rtsp")
@@ -24,6 +78,7 @@ class Camera(Base):
     location = Column(String(500), nullable=True)
     status = Column(String(50), default="offline")  # online, offline, error
     ai_mode = Column(String(50), default="balanced")
+    task_profile = Column(String(50), nullable=False, default="aerial_small_objects", server_default="aerial_small_objects")
     pipeline_mode = Column(String(20), nullable=False, default="automatic", server_default="automatic")
     pipeline_config = Column(JSON, nullable=True, default=dict)
     priority = Column(Integer, default=1)
@@ -39,55 +94,37 @@ class Camera(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now(), server_default=func.now())
 
-    tracks = relationship("VehicleTrack", back_populates="camera")
+    object_tracks = relationship("ObjectTrack", back_populates="source")
     events = relationship("Event", back_populates="camera")
+    project = relationship("Project", back_populates="sources")
+    pipeline = relationship("PipelineDefinition")
 
 
-class VehicleTrack(Base):
-    __tablename__ = "vehicle_tracks"
+class ObjectTrack(Base):
+    __tablename__ = "object_tracks"
 
     id = Column(Integer, primary_key=True, index=True)
-    camera_id = Column(Integer, ForeignKey("cameras.id"), nullable=False)
+    source_id = Column(Integer, ForeignKey("cameras.id", ondelete="CASCADE"), nullable=False, index=True)
+    processing_run_id = Column(String(64), nullable=False, index=True)
     track_id = Column(Integer, nullable=False)
-    vehicle_class = Column(String(50), nullable=False)
-    final_plate = Column(String(20), nullable=True)
-    plate_status = Column(String(30), default="searching")  # searching, candidate, verified, low_confidence, invalid
-    final_plate_confidence = Column(Float, default=0.0)
-    color = Column(String(30), default="unknown")
-    color_confidence = Column(Float, default=0.0)
-    vehicle_make = Column(String(80), nullable=False, default="unknown", server_default="unknown")
-    make_confidence = Column(Float, nullable=False, default=0.0, server_default="0")
+    object_class = Column(String(100), nullable=False, index=True)
+    confidence = Column(Float, nullable=False, default=0.0)
+    trajectory = Column(JSON, nullable=False, default=list)
+    speed_pixels_per_second = Column(Float, nullable=False, default=0.0)
+    direction_degrees = Column(Float, nullable=True)
+    state = Column(String(30), nullable=False, default="active")
+    attributes = Column(JSON, nullable=False, default=dict)
+    best_crop_path = Column(String(500), nullable=True)
+    last_bbox = Column(JSON, nullable=False, default=list)
+    first_video_timestamp_seconds = Column(Float, nullable=True)
+    last_video_timestamp_seconds = Column(Float, nullable=True)
     first_seen = Column(DateTime(timezone=True), server_default=func.now())
     last_seen = Column(DateTime(timezone=True), server_default=func.now())
-    duration_seconds = Column(Float, default=0.0)
-    best_vehicle_crop_path = Column(String(500), nullable=True)
-    best_plate_crop_path = Column(String(500), nullable=True)
-    processing_run_id = Column(String(64), nullable=False, default="legacy", server_default="legacy")
-    recognition_diagnostics = Column(JSON, nullable=True, default=dict)
+    duration_seconds = Column(Float, nullable=False, default=0.0)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now(), server_default=func.now())
 
-    camera = relationship("Camera", back_populates="tracks")
-    plate_candidates = relationship("PlateCandidate", back_populates="vehicle_track")
-    events = relationship("Event", back_populates="vehicle_track")
-
-
-class PlateCandidate(Base):
-    __tablename__ = "plate_candidates"
-
-    id = Column(Integer, primary_key=True, index=True)
-    vehicle_track_id = Column(Integer, ForeignKey("vehicle_tracks.id"), nullable=False)
-    plate_text = Column(String(20), nullable=False)
-    raw_ocr_text = Column(String(100), nullable=True)
-    confidence = Column(Float, default=0.0)
-    regex_valid = Column(Boolean, default=False)
-    regex_score = Column(Float, default=0.0)
-    image_quality_score = Column(Float, default=0.0)
-    frame_timestamp = Column(DateTime(timezone=True), server_default=func.now())
-    crop_path = Column(String(500), nullable=True)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-
-    vehicle_track = relationship("VehicleTrack", back_populates="plate_candidates")
+    source = relationship("Camera", back_populates="object_tracks")
 
 
 class Event(Base):
@@ -95,14 +132,13 @@ class Event(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     camera_id = Column(Integer, ForeignKey("cameras.id"), nullable=False)
-    vehicle_track_id = Column(Integer, ForeignKey("vehicle_tracks.id"), nullable=True)
+    object_track_id = Column(Integer, ForeignKey("object_tracks.id"), nullable=True)
     event_type = Column(String(50), nullable=False)
     payload_json = Column(JSON, nullable=True)
     frame_path = Column(String(500), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     camera = relationship("Camera", back_populates="events")
-    vehicle_track = relationship("VehicleTrack", back_populates="events")
 
 
 class User(Base):
@@ -112,18 +148,6 @@ class User(Base):
     email = Column(String(255), unique=True, nullable=False, index=True)
     password_hash = Column(String(255), nullable=False)
     role = Column(String(20), default="viewer")  # admin, operator, viewer
-    is_active = Column(Boolean, default=True)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now(), server_default=func.now())
-
-
-class WatchlistEntry(Base):
-    __tablename__ = "watchlist"
-
-    id = Column(Integer, primary_key=True, index=True)
-    plate_number = Column(String(20), nullable=False, index=True)
-    description = Column(Text, nullable=True)
-    alert_channels = Column(JSON, default=["frontend"])  # frontend, webhook, email, telegram
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now(), server_default=func.now())
@@ -162,7 +186,7 @@ class GeminiReviewCandidate(Base):
     mask_path = Column(String(500), nullable=True)
     frame_width = Column(Integer, nullable=False)
     frame_height = Column(Integer, nullable=False)
-    target_model_type = Column(String(50), nullable=False, default="vehicle_segmenter")
+    target_model_type = Column(String(50), nullable=False, default="object_segmenter")
     local_predictions = Column(JSON, nullable=True, default=list)
     gemini_verification = Column(JSON, nullable=True)
     proposed_annotations = Column(JSON, nullable=True, default=list)
@@ -201,7 +225,8 @@ async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         await conn.run_sync(_ensure_camera_source_columns)
-        await conn.run_sync(_ensure_vehicle_track_columns)
+        await conn.run_sync(_ensure_event_object_columns)
+        await conn.run_sync(_ensure_object_track_columns)
 
 
 def _ensure_camera_source_columns(sync_conn):
@@ -233,6 +258,16 @@ def _ensure_camera_source_columns(sync_conn):
         ))
     if "pipeline_config" not in columns:
         sync_conn.execute(text("ALTER TABLE cameras ADD COLUMN pipeline_config JSON"))
+    if "project_id" not in columns:
+        sync_conn.execute(text("ALTER TABLE cameras ADD COLUMN project_id INTEGER"))
+        sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_cameras_project_id ON cameras (project_id)"))
+    if "pipeline_id" not in columns:
+        sync_conn.execute(text("ALTER TABLE cameras ADD COLUMN pipeline_id INTEGER"))
+        sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_cameras_pipeline_id ON cameras (pipeline_id)"))
+    if "task_profile" not in columns:
+        sync_conn.execute(text(
+            "ALTER TABLE cameras ADD COLUMN task_profile VARCHAR(50) NOT NULL DEFAULT 'aerial_small_objects'"
+        ))
     gemini_columns = {
         "gemini_enabled": "BOOLEAN NOT NULL DEFAULT false",
         "gemini_verify_predictions": "BOOLEAN NOT NULL DEFAULT true",
@@ -246,26 +281,29 @@ def _ensure_camera_source_columns(sync_conn):
                 f"ALTER TABLE cameras ADD COLUMN {column_name} {definition}"
             ))
 
-
-def _ensure_vehicle_track_columns(sync_conn):
-    """Upgrade legacy create_all databases with recognition persistence fields."""
+def _ensure_event_object_columns(sync_conn):
     inspector = inspect(sync_conn)
-    if not inspector.has_table("vehicle_tracks"):
+    if not inspector.has_table("events"):
         return
-    columns = {column["name"] for column in inspector.get_columns("vehicle_tracks")}
-    if "processing_run_id" not in columns:
-        sync_conn.execute(text(
-            "ALTER TABLE vehicle_tracks ADD COLUMN processing_run_id VARCHAR(64) NOT NULL DEFAULT 'legacy'"
-        ))
-    if "recognition_diagnostics" not in columns:
-        sync_conn.execute(text(
-            "ALTER TABLE vehicle_tracks ADD COLUMN recognition_diagnostics JSON"
-        ))
-    if "vehicle_make" not in columns:
-        sync_conn.execute(text(
-            "ALTER TABLE vehicle_tracks ADD COLUMN vehicle_make VARCHAR(80) NOT NULL DEFAULT 'unknown'"
-        ))
-    if "make_confidence" not in columns:
-        sync_conn.execute(text(
-            "ALTER TABLE vehicle_tracks ADD COLUMN make_confidence FLOAT NOT NULL DEFAULT 0"
-        ))
+    columns = {column["name"] for column in inspector.get_columns("events")}
+    if "object_track_id" not in columns:
+        sync_conn.execute(text("ALTER TABLE events ADD COLUMN object_track_id INTEGER"))
+        sync_conn.execute(text("CREATE INDEX IF NOT EXISTS ix_events_object_track_id ON events (object_track_id)"))
+
+
+def _ensure_object_track_columns(sync_conn):
+    """Keep databases created before the object registry view compatible."""
+    inspector = inspect(sync_conn)
+    if not inspector.has_table("object_tracks"):
+        return
+    columns = {column["name"] for column in inspector.get_columns("object_tracks")}
+    additions = {
+        "last_bbox": "JSON NOT NULL DEFAULT '[]'",
+        "first_video_timestamp_seconds": "FLOAT",
+        "last_video_timestamp_seconds": "FLOAT",
+    }
+    for column_name, definition in additions.items():
+        if column_name not in columns:
+            sync_conn.execute(text(
+                f"ALTER TABLE object_tracks ADD COLUMN {column_name} {definition}"
+            ))

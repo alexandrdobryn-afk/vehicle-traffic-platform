@@ -14,7 +14,7 @@ class GeminiTrainingServiceTest(unittest.TestCase):
         ok, encoded = cv2.imencode(".png", mask)
         self.assertTrue(ok)
         objects = [{
-            "label": "car",
+            "label": "target",
             "confidence": 0.9,
             "box_2d": [100, 100, 900, 900],
             "mask": base64.b64encode(encoded).decode("ascii"),

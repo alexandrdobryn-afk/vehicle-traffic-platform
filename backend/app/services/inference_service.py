@@ -10,16 +10,20 @@ from datetime import datetime, timezone
 import logging
 
 from app.config import settings, AIMode
-from app.services.vehicle_detection_service import VehicleDetectionService, Detection
-from app.services.plate_detection_service import PlateDetectionService
-from app.services.ocr_service import OCRService, OCRCandidate
-from app.services.color_recognition_service import ColorRecognitionService
-from app.services.brand_recognition_service import BrandRecognitionService
+from app.services.object_detection_service import ObjectDetectionService, Detection
 from app.services.tracking_service import TrackingService, TrackedObject
 from app.services.frame_quality_service import FrameQualityService
 from app.services.track_state_service import TrackStateService, ActiveTrack
 from app.models.model_registry import model_registry
 from app.services.runtime_service import resolve_execution_policy
+from app.services.kalman_prediction_service import KalmanPredictionService
+from app.services.classification_service import ClassificationService
+from app.services.segmentation_service import SegmentationService
+from app.services.ocr_service import OCRService
+from app.services.reid_service import ReIdentificationService
+from app.services.super_resolution_service import SuperResolutionService
+from app.services.geo_projection_service import GeoProjectionService
+from app.services.object_memory_service import ObjectMemoryService
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +40,7 @@ async def _run_compute(callback, *args, **kwargs):
 class InferencePipeline:
     """
     Orchestrates the full AI pipeline per camera:
-    Frame → Detect → Track → Crop → Plate → OCR → Color → State
+    Frame -> Detect -> Track -> Kalman -> Classify/Segment -> State
     Supports Speed / Balanced / Quality / Hybrid modes.
     """
 
@@ -55,6 +59,21 @@ class InferencePipeline:
         self.runtime_settings = runtime_settings or {}
         self.pipeline_mode = self.runtime_settings.get("pipeline_mode", "automatic")
         self.pipeline_config = self.runtime_settings.get("pipeline_config") or {}
+        self.task_profile = "aerial_small_objects"
+        configured_classes = self.runtime_settings.get("target_classes")
+        self.target_classes = self._normalize_target_classes(
+            configured_classes if isinstance(configured_classes, list)
+            else self.pipeline_config.get("target_classes", [])
+        )
+        raw_aerial = self.runtime_settings.get("aerial") or self.pipeline_config.get("aerial") or {}
+        self.aerial_config = {
+            "enabled": self.task_profile == "aerial_small_objects" or bool(raw_aerial.get("enabled", False)),
+            "size": raw_aerial.get("tile_size", raw_aerial.get("size", 1024)),
+            "overlap": raw_aerial.get("tile_overlap", raw_aerial.get("overlap", 0.2)),
+            "nms_iou": raw_aerial.get("nms_iou", 0.5),
+            "scale": raw_aerial.get("scale", 1.0),
+            "enhance": raw_aerial.get("enhance", False),
+        }
         self.runtime_policy = resolve_execution_policy(
             self.runtime_settings.get("execution_provider", "auto"),
             int(self.runtime_settings.get("gpu_device_index", 0)),
@@ -86,18 +105,56 @@ class InferencePipeline:
             "edge_onnx": settings.FRAME_SKIP_SPEED,
         }.get(ai_mode, 2)
         self.frame_skip = max(1, int(self.runtime_settings.get("frame_skip", default_frame_skip)))
-        self.vehicle_confidence = float(self.runtime_settings.get(
-            "vehicle_confidence_threshold", settings.VEHICLE_CONFIDENCE_THRESHOLD
+        self.object_confidence = float(self.runtime_settings.get(
+            "object_confidence_threshold", 0.35
         ))
+        self.min_track_frames_for_event = max(1, int(self.runtime_settings.get(
+            "min_track_frames_for_event",
+            self.pipeline_config.get("min_track_frames_for_event", 4),
+        )))
+        self.min_track_duration_seconds = max(0.0, float(self.runtime_settings.get(
+            "min_track_duration_seconds",
+            self.pipeline_config.get("min_track_duration_seconds", 0.25),
+        )))
+        self.detection_filters = {
+            "min_box_width": max(1, int(self.runtime_settings.get(
+                "min_box_width", self.pipeline_config.get("min_box_width", 14)
+            ))),
+            "min_box_height": max(1, int(self.runtime_settings.get(
+                "min_box_height", self.pipeline_config.get("min_box_height", 14)
+            ))),
+            "min_box_area_ratio": max(0.0, float(self.runtime_settings.get(
+                "min_box_area_ratio", self.pipeline_config.get("min_box_area_ratio", 0.00008)
+            ))),
+            "max_box_area_ratio": min(1.0, float(self.runtime_settings.get(
+                "max_box_area_ratio", self.pipeline_config.get("max_box_area_ratio", 0.25)
+            ))),
+            "max_box_aspect_ratio": max(1.0, float(self.runtime_settings.get(
+                "max_box_aspect_ratio", self.pipeline_config.get("max_box_aspect_ratio", 6.0)
+            ))),
+        }
         self.save_crops = bool(self.runtime_settings.get("save_crops", True))
         self.anonymization_mode = bool(self.runtime_settings.get("anonymization_mode", False))
-        self.color_interval_frames = max(1, int(self.runtime_settings.get("color_interval_frames", 5)))
-        self.brand_interval_frames = max(1, int(self.runtime_settings.get("brand_interval_frames", 30)))
-        self.plate_interval_frames = max(1, int(self.runtime_settings.get("plate_interval_frames", 5)))
+        self.classification_config = self.runtime_settings.get("classification") or self.pipeline_config.get("classification") or {}
+        self.segmentation_config = self.runtime_settings.get("segmentation") or self.pipeline_config.get("segmentation") or {}
+        self.kalman_config = self.runtime_settings.get("kalman_prediction") or self.pipeline_config.get("kalman_prediction") or {}
+        self.ocr_config = self.runtime_settings.get("ocr") or self.pipeline_config.get("ocr") or {}
+        self.reid_config = self.runtime_settings.get("reid") or self.pipeline_config.get("reid") or {}
+        self.object_memory_config = self.runtime_settings.get("object_memory") or self.pipeline_config.get("object_memory") or {}
+        self.geo_config = self.runtime_settings.get("geo") or self.pipeline_config.get("geo") or {}
+        self.super_resolution_config = self.runtime_settings.get("super_resolution") or self.pipeline_config.get("super_resolution") or {}
+        self.telemetry_config = self.runtime_settings.get("telemetry") or self.pipeline_config.get("telemetry") or {}
+        self.classification_interval_frames = max(1, int(self.classification_config.get("interval_frames", 15)))
+        self.segmentation_interval_frames = max(1, int(self.segmentation_config.get("interval_frames", 5)))
+        self.ocr_interval_frames = max(1, int(self.ocr_config.get("interval_frames", 30)))
         resolution = str(self.runtime_settings.get("input_resolution", "")).lower().split("x")
         self.input_resolution = None
         if len(resolution) == 2 and all(part.isdigit() for part in resolution):
             self.input_resolution = (int(resolution[0]), int(resolution[1]))
+        # Tiling must receive the untouched high-resolution frame. A global
+        # resize before tiling destroys the small-object detail it is meant to preserve.
+        if self.aerial_config["enabled"]:
+            self.input_resolution = None
 
         self._init_services()
 
@@ -106,29 +163,18 @@ class InferencePipeline:
         logger.info(f"[Pipeline cam={self.camera_id}] Initializing {self.ai_mode} mode")
 
         manual = self.pipeline_config if self.pipeline_mode == "manual" else {}
-        vehicle_model = (
-            model_registry.get_named_vehicle_detector(
-                manual.get("vehicle_detector"),
+        object_model = (
+            model_registry.get_named_object_detector(
+                manual.get("object_detector"),
                 self.ai_mode,
             )
-            if manual.get("vehicle_detector")
-            else model_registry.get_vehicle_detector(self.ai_mode)
+            if manual.get("object_detector")
+            else model_registry.get_object_detector(self.ai_mode)
         )
-        plate_model = (
-            model_registry.get_named_plate_detector(
-                manual.get("plate_detector"),
-                self.ai_mode,
+        if self.ai_mode == "hybrid" and object_model.model_type != "yolo":
+            raise RuntimeError(
+                "Dual verification mode requires a YOLO detector as the first pass"
             )
-            if manual.get("plate_detector")
-            else model_registry.get_plate_detector(self.ai_mode)
-        )
-        ocr_engine = manual.get("ocr_engine") or self.runtime_settings.get("ocr_engine")
-        ocr_model = (
-            model_registry.get_named_ocr_engine(ocr_engine, self.ai_mode)
-            if ocr_engine else model_registry.get_ocr_engine(self.ai_mode)
-        )
-        color_model = model_registry.get_color_classifier()
-        brand_model = model_registry.get_brand_classifier()
 
         # Choose tracker
         default_tracker = {
@@ -136,75 +182,111 @@ class InferencePipeline:
             "balanced": "bytetrack",
             "quality": "botsort",
             "hybrid": "bytetrack",
-            "practical": "tracktrack",
-            "max_accuracy": "tracktrack",
+            "practical": "ocsort",
+            "max_accuracy": "botsort",
             "edge_onnx": "bytetrack",
         }.get(self.ai_mode, "bytetrack")
         tracker_mode = manual.get("tracker") or self.runtime_settings.get("tracker_mode", default_tracker)
+        object_memory_enabled = bool(self.object_memory_config.get("enabled", True))
 
-        self.detector = VehicleDetectionService(
+        self.detector = ObjectDetectionService(
             ai_mode=AIMode(self.ai_mode),
-            model_config=vehicle_model,
+            model_config=object_model,
             execution_device=self.execution_device,
+            accepted_classes=self.target_classes,
+            aerial_config=self.aerial_config,
         )
         self.rfdetr_detector = None
         if self.ai_mode == "hybrid":
-            rfdetr_model = model_registry.get_named_vehicle_detector(
-                "rfdetr_medium_vehicle", self.ai_mode
-            )
-            self.rfdetr_detector = VehicleDetectionService(
-                ai_mode=AIMode.QUALITY,
-                model_config=rfdetr_model,
-                execution_device=self.execution_device,
-            )
-        self.tracker = TrackingService(tracker_mode=tracker_mode, ai_mode=self.ai_mode)
-        self.plate_detector = PlateDetectionService(
-            model_config=plate_model,
-            execution_device=self.execution_device,
-            confidence_threshold=float(self.runtime_settings.get(
-                "plate_confidence_threshold", settings.PLATE_CONFIDENCE_THRESHOLD
-            )),
+            try:
+                verifier_name = manual.get("verifier_detector") or "rfdetr_medium_object"
+                rfdetr_model = model_registry.get_named_object_detector(
+                    verifier_name, self.ai_mode
+                )
+                if rfdetr_model.model_type != "rfdetr":
+                    raise RuntimeError("Dual verification requires RF-DETR as verifier")
+                self.rfdetr_detector = ObjectDetectionService(
+                    ai_mode=AIMode.QUALITY,
+                    model_config=rfdetr_model,
+                    execution_device=self.execution_device,
+                    accepted_classes=self.target_classes,
+                    aerial_config=self.aerial_config,
+                )
+            except Exception as exc:
+                logger.warning("Hybrid RF-DETR re-check disabled: %s", exc)
+        self.tracker = TrackingService(
+            tracker_mode=tracker_mode,
+            ai_mode=self.ai_mode,
+            identity_stitching=False,
         )
+        reid_enabled = bool(self.reid_config.get("enabled", False))
+        reid_model_name = str(self.reid_config.get("model", "hsv_histogram_v1"))
+        if reid_model_name == "auto":
+            reid_model_name = "hsv_histogram_v1"
+        self.re_identifier = ReIdentificationService(
+            similarity_threshold=float(self.reid_config.get("similarity_threshold", 0.72)),
+            model_name=reid_model_name,
+        ) if reid_enabled else None
+        self.object_memory = ObjectMemoryService(
+            max_gap_frames=int(self.object_memory_config.get("max_gap_frames", 90)),
+            merge_threshold=float(self.object_memory_config.get("merge_threshold", 0.48)),
+            duplicate_iou=float(self.object_memory_config.get("duplicate_iou", 0.45)),
+            duplicate_contained=float(self.object_memory_config.get("duplicate_contained", 0.78)),
+            appearance_threshold=float(self.object_memory_config.get("appearance_threshold", 0.68)),
+            embedding_enabled=reid_enabled,
+            embedding_model=reid_model_name,
+            store_embedding_vector=bool(self.reid_config.get("store_vector", False)),
+        ) if object_memory_enabled else None
+        kalman_enabled = bool(self.kalman_config.get("enabled", self.task_profile == "aerial_small_objects"))
+        max_prediction_frames = max(0, min(2, int(self.kalman_config.get("max_prediction_frames", 2))))
+        self.kalman_predictor = KalmanPredictionService(
+            max_prediction_frames=max_prediction_frames,
+            smoothing=bool(self.kalman_config.get("smoothing", True)),
+        ) if kalman_enabled else None
+        classifier_model = model_registry.get_object_classifier()
+        classifier_enabled = bool(self.classification_config.get("enabled", False))
+        self.classifier = ClassificationService(
+            classifier_model,
+            execution_device=self.execution_device,
+            threshold=float(self.classification_config.get("confidence_threshold", 0.35)),
+        ) if classifier_enabled else None
+        segmenter_model = model_registry.get_object_segmenter()
+        segmentation_enabled = bool(self.segmentation_config.get("enabled", False))
+        self.segmenter = SegmentationService(
+            segmenter_model,
+            execution_device=self.execution_device,
+            threshold=float(self.segmentation_config.get("confidence_threshold", 0.35)),
+        ) if segmentation_enabled else None
+        ocr_enabled = bool(self.ocr_config.get("enabled", False))
+        ocr_model = model_registry.get_text_ocr_engine(self.ai_mode) if ocr_enabled else None
         self.ocr = OCRService(
-            engine=ocr_model.model_type,
-            model_config=ocr_model,
-            regex_profile=self.runtime_settings.get("plate_regex_profile", "AUTO"),
-            confidence_threshold=float(self.runtime_settings.get(
-                "ocr_threshold", settings.OCR_CONFIDENCE_THRESHOLD
-            )),
-            voting_window=int(self.runtime_settings.get(
-                "ocr_voting_window", settings.OCR_VOTING_WINDOW
-            )),
+            ocr_model,
             execution_device=self.execution_device,
-        )
-        self.color_service = ColorRecognitionService(
-            model_config=color_model, execution_device=self.execution_device
-        )
-        self.brand_service = BrandRecognitionService(
-            model_config=brand_model, execution_device=self.execution_device
-        )
-        self.quality_service = FrameQualityService(
-            min_plate_width=int(self.runtime_settings.get(
-                "minimum_plate_width", settings.MIN_PLATE_WIDTH
-            )),
-            min_plate_height=int(self.runtime_settings.get(
-                "minimum_plate_height", settings.MIN_PLATE_HEIGHT
-            )),
-        )
+            threshold=float(self.ocr_config.get("confidence_threshold", 0.35)),
+        ) if ocr_enabled and ocr_model is not None else None
+        geo_enabled = bool(self.geo_config.get("enabled", False))
+        self.geo_projector = GeoProjectionService(
+            telemetry=self.telemetry_config,
+            coordinate_output=bool(self.geo_config.get("coordinate_output", False)),
+        ) if geo_enabled else None
+        super_resolution_enabled = bool(self.super_resolution_config.get("enabled", False))
+        self.super_resolver = SuperResolutionService(
+            engine=str(self.super_resolution_config.get("engine", "auto")),
+            min_object_size_px=int(self.super_resolution_config.get("min_object_size_px", 32)),
+            max_crops_per_frame=int(self.super_resolution_config.get("max_crops_per_frame", 8)),
+        ) if super_resolution_enabled else None
+        self.quality_service = FrameQualityService()
         self.track_state = TrackStateService(
             camera_id=self.camera_id,
             redis_client=self.redis,
             processing_run_id=self.processing_run_id,
-            max_missing_frames=int(self.runtime_settings.get("track_missing_grace_frames", 15)),
+            max_missing_frames=max(1, min(6, int(self.runtime_settings.get("track_missing_grace_frames", 6)))),
         )
-
-        # Track-level OCR candidate pools
-        self._ocr_candidates: Dict[int, List[OCRCandidate]] = {}
-        self._color_histories: Dict[int, list] = {}
-        self._brand_histories: Dict[int, list] = {}
         self.resolved_pipeline = {
             "pipeline_mode": self.pipeline_mode,
             "ai_mode": self.ai_mode,
+            "task_profile": self.task_profile,
+            "target_classes": self.target_classes,
             "runtime": {
                 key: self.runtime_policy[key]
                 for key in (
@@ -212,21 +294,56 @@ class InferencePipeline:
                     "fallback_reason", "gpu_device_index", "precision",
                 )
             },
-            "vehicle_detector": {"name": vehicle_model.name, "format": vehicle_model.format},
+            "object_detector": {"name": object_model.name, "format": object_model.format},
             "escalation_detector": (
-                {"name": "rfdetr_medium_vehicle", "format": "auto"}
+                {"name": self.rfdetr_detector.model_config.name, "format": self.rfdetr_detector.model_config.format}
                 if self.rfdetr_detector else None
             ),
             "tracker": {"name": self.tracker.resolved_mode, "format": "algorithm"},
-            "plate_detector": {"name": plate_model.name, "format": plate_model.format},
-            "ocr": {"name": self.ocr.resolved_engine, "format": ocr_model.format},
-            "color": {"name": color_model.name if color_model.available else "HSV/KMeans fallback", "format": color_model.format if color_model.available else "algorithm"},
-            "brand": {"name": brand_model.name if brand_model.available else "unavailable", "format": brand_model.format if brand_model.available else "optional"},
+            "object_memory": {
+                "name": "canonical_object_memory",
+                "format": "algorithm",
+                "enabled": object_memory_enabled,
+                "available": object_memory_enabled,
+                "embedding_matching": reid_enabled,
+            },
+            "kalman_prediction": ({"name": "constant_velocity_kalman", "format": "algorithm"} if self.kalman_predictor else None),
+            "classification": ({"name": classifier_model.name, "format": classifier_model.format, "available": self.classifier.available} if self.classifier else None),
+            "segmentation": ({"name": segmenter_model.name, "format": segmenter_model.format, "available": self.segmenter.available} if self.segmenter else None),
+            "ocr": {
+                "name": ocr_model.name if ocr_model else self.ocr_config.get("engine", "auto"),
+                "format": ocr_model.format if ocr_model else "optional_adapter",
+                "enabled": ocr_enabled,
+                "available": bool(self.ocr and self.ocr.available),
+            },
+            "reid": {
+                "name": reid_model_name,
+                "format": "algorithm",
+                "enabled": reid_enabled,
+                "available": bool(self.re_identifier and self.re_identifier.available),
+                "role": "embedding_matching",
+                "store_vector": bool(self.reid_config.get("store_vector", False)),
+            },
+            "geo": {
+                "name": self.geo_config.get("telemetry_source", "metadata"),
+                "format": "metadata",
+                "enabled": geo_enabled,
+                "available": bool(self.geo_projector and self.geo_projector.available),
+                "coordinate_output": bool(self.geo_config.get("coordinate_output", False)),
+            },
+            "super_resolution": {
+                "name": "opencv_lanczos",
+                "format": "algorithm",
+                "enabled": super_resolution_enabled,
+                "available": bool(self.super_resolver and self.super_resolver.available),
+            },
             "features": {
-                "temporal_voting": True,
-                "vehicle_reid": False,
-                "identity_stitching": True,
+                "object_memory": object_memory_enabled,
+                "embedding_matching": reid_enabled,
+                "identity_stitching": object_memory_enabled,
                 "confidence_engine": True,
+                "tiled_inference": self.aerial_config["enabled"],
+                "preserve_source_resolution": self.aerial_config["enabled"],
             },
         }
 
@@ -236,6 +353,7 @@ class InferencePipeline:
         self,
         frame: np.ndarray,
         source_frame: Optional[np.ndarray] = None,
+        source_metadata: Optional[dict] = None,
     ) -> Optional[dict]:
         """
         Process one frame through the full pipeline.
@@ -244,6 +362,8 @@ class InferencePipeline:
         self.frame_count += 1
         t_start = time.time()
         source_frame = source_frame if source_frame is not None else frame
+        source_metadata = source_metadata or {}
+        video_timestamp_seconds = source_metadata.get("video_timestamp_seconds")
         self.source_resolution = (source_frame.shape[1], source_frame.shape[0])
 
         # Frame skip
@@ -260,26 +380,32 @@ class InferencePipeline:
 
         now = datetime.now(timezone.utc).isoformat()
         stage_latency = {
-            "vehicle_detection": 0.0,
+            "object_detection": 0.0,
             "tracking": 0.0,
-            "color": 0.0,
-            "brand": 0.0,
-            "plate_detection": 0.0,
-            "ocr": 0.0,
+            "embedding": 0.0,
+            "object_memory": 0.0,
             "redis": 0.0,
+            "kalman_prediction": 0.0,
+            "classification": 0.0,
+            "segmentation": 0.0,
+            "ocr": 0.0,
+            "reid": 0.0,
+            "geo": 0.0,
+            "super_resolution": 0.0,
         }
 
-        # ── 1. Vehicle Detection ───────────────────────────────────
+        # в”Ђв”Ђ 1. Object detection в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
         use_rfdetr = self.detector.rfdetr_model is not None and self.ai_mode in {"quality", "max_accuracy"}
         stage_started = time.perf_counter()
         detections: List[Detection] = await _run_compute(
             self.detector.detect,
             frame,
-            confidence_threshold=self.vehicle_confidence,
+            confidence_threshold=self.object_confidence,
             use_rfdetr=use_rfdetr,
         )
-        stage_latency["vehicle_detection"] += (time.perf_counter() - stage_started) * 1000
-        self.stage_counts["vehicles_detected"] += len(detections)
+        detections = self._filter_detections(detections, frame.shape)
+        stage_latency["object_detection"] += (time.perf_counter() - stage_started) * 1000
+        self.stage_counts["objects_detected"] += len(detections)
 
         # Hybrid: re-check with RF-DETR if low confidence
         if self.ai_mode == "hybrid" and self.rfdetr_detector is not None:
@@ -290,338 +416,184 @@ class InferencePipeline:
                 detections = await _run_compute(
                     self.rfdetr_detector.detect,
                     frame,
-                    confidence_threshold=self.vehicle_confidence,
+                    confidence_threshold=self.object_confidence,
                     use_rfdetr=True,
                 )
-                stage_latency["vehicle_detection"] += (time.perf_counter() - stage_started) * 1000
+                detections = self._filter_detections(detections, frame.shape)
+                stage_latency["object_detection"] += (time.perf_counter() - stage_started) * 1000
                 self.stage_counts["rfdetr_escalations"] += 1
 
-        # ── 2. Tracking ───────────────────────────────────────────
+        # в”Ђв”Ђ 2. Tracking в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
         stage_started = time.perf_counter()
         tracked_objects: List[TrackedObject] = await _run_compute(
             self.tracker.update, detections, frame
         )
         stage_latency["tracking"] += (time.perf_counter() - stage_started) * 1000
+        if self.object_memory is not None and self.re_identifier is not None and self.re_identifier.available:
+            stage_started = time.perf_counter()
+            embedded = 0
+            for tracked in tracked_objects:
+                object_crop = self._crop_source_object(frame, frame, tracked.bbox, padding=4)
+                embedding = await _run_compute(self.re_identifier.embed, object_crop)
+                vector = embedding.get("vector")
+                if vector:
+                    tracked.appearance_signature = vector
+                    embedded += 1
+            self.stage_counts["objects_embedded"] += embedded
+            stage_latency["embedding"] += (time.perf_counter() - stage_started) * 1000
+        if self.object_memory is not None:
+            stage_started = time.perf_counter()
+            tracked_objects = self.object_memory.update(tracked_objects, frame)
+            object_memory_stats = self.object_memory.last_stats
+            if object_memory_stats.get("merged_tracks"):
+                self.stage_counts["object_memory_merged_tracks"] += object_memory_stats["merged_tracks"]
+            if object_memory_stats.get("same_frame_duplicates"):
+                self.stage_counts["object_memory_suppressed_duplicates"] += object_memory_stats["same_frame_duplicates"]
+            stage_latency["object_memory"] += (time.perf_counter() - stage_started) * 1000
+        if self.kalman_predictor is not None:
+            stage_started = time.perf_counter()
+            tracked_objects = self.kalman_predictor.update(tracked_objects, frame.shape)
+            before_dedupe = len(tracked_objects)
+            tracked_objects = self._suppress_duplicate_tracks(tracked_objects)
+            suppressed = before_dedupe - len(tracked_objects)
+            if suppressed:
+                self.stage_counts["tracks_suppressed_duplicate"] += suppressed
+            stage_latency["kalman_prediction"] += (time.perf_counter() - stage_started) * 1000
+            self.stage_counts["kalman_predicted_objects"] += sum(1 for item in tracked_objects if item.predicted)
         active_ids = [t.track_id for t in tracked_objects]
 
-        # ── 3. Per-track processing ───────────────────────────────
+        segments = []
+        if self.segmenter is not None and self.segmenter.available and self.frame_count % self.segmentation_interval_frames == 0:
+            stage_started = time.perf_counter()
+            segments = await _run_compute(self.segmenter.segment, frame)
+            stage_latency["segmentation"] += (time.perf_counter() - stage_started) * 1000
+            self.stage_counts["segments_detected"] += len(segments)
+        if self.super_resolver is not None:
+            self.super_resolver.begin_frame()
+
+        # в”Ђв”Ђ 3. Per-track processing в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
         ws_objects = []
         redis_tracks = []
-        await _run_compute(self.color_service.update_scene_context, source_frame)
-
         for tracked in tracked_objects:
             tid = tracked.track_id
             track, is_new = await self.track_state.upsert_track(
                 track_id=tid,
-                vehicle_class=tracked.class_name,
+                object_class=tracked.class_name,
                 bbox=tracked.bbox,
                 detection_conf=tracked.confidence,
                 now=now,
+                predicted=tracked.predicted,
+                motion_vector=tracked.motion_vector,
+                video_timestamp_seconds=video_timestamp_seconds,
             )
-
-            # Fire "vehicle_entered" event on first appearance
-            if is_new:
-                await self._fire_event("vehicle_entered", track, frame)
+            if self.object_memory is not None:
+                memory_card = self.object_memory.card_summary(tid)
+                if memory_card:
+                    await self.track_state.update_attributes(tid, object_memory=memory_card)
 
             # Detect/track on the analysis frame, but preserve source pixels for
-            # color, plate detection, OCR and stored evidence.
-            vehicle_crop = self._crop_source_vehicle(
+            # stored evidence.
+            object_crop = self._crop_source_object(
                 frame, source_frame, tracked.bbox, padding=10
             )
+            analysis_crop = object_crop
 
-            # ── Color recognition (every N frames) ────────────────
-            if track.frame_count % self.color_interval_frames == 1:
+            if tracked.predicted:
+                updated_track = await self.track_state.get_track(tid)
+                if updated_track:
+                    redis_tracks.append(updated_track)
+                    ws_objects.append(updated_track.to_ws_dict())
+                continue
+
+            if self.super_resolver is not None and self.super_resolver.available:
                 stage_started = time.perf_counter()
-                color_observation = await _run_compute(
-                    self.color_service.recognize_details, vehicle_crop
+                analysis_crop, super_resolution = await _run_compute(
+                    self.super_resolver.enhance,
+                    object_crop,
                 )
-                stage_latency["color"] += (time.perf_counter() - stage_started) * 1000
-                if tid not in self._color_histories:
-                    self._color_histories[tid] = []
-                self._color_histories[tid] = self.color_service.update_color_voting(
-                    self._color_histories[tid],
-                    color_observation["color"],
-                    color_observation["confidence"],
-                    hex_code=color_observation["hex_code"],
-                    quality_score=color_observation["quality_score"],
-                    frame_index=track.frame_count,
-                )
-                color_result = self.color_service.resolve_color_details(
-                    self._color_histories[tid]
-                )
-                final_color = color_result["color"]
-                final_color_conf = color_result["confidence"]
-                await self.track_state.update_color(tid, final_color, final_color_conf, self._color_histories[tid])
-                await self.track_state.update_diagnostics(
-                    tid,
-                    color={
-                        "status": "recognized" if final_color != "unknown" else "uncertain",
-                        "value": final_color,
-                        "confidence": round(final_color_conf, 3),
-                        "engine": "onnx" if self.color_service.model_session is not None else "hsv_fallback",
-                        "html_hex": color_result["hex_code"],
-                        "candidate_value": color_result["candidate_color"],
-                        "sample_count": color_result["sample_count"],
-                        "support_count": color_result["support_count"],
-                        "distribution": color_result["distribution"],
-                        "provisional": color_result["provisional"],
-                    },
-                )
-                self.stage_counts[
-                    "colors_recognized" if final_color != "unknown" else "colors_uncertain"
-                ] += 1
+                stage_latency["super_resolution"] += (time.perf_counter() - stage_started) * 1000
+                await self.track_state.update_attributes(tid, super_resolution=super_resolution)
+                self.stage_counts["super_resolution_enhanced"] += int(super_resolution["status"] == "enhanced")
 
-            # Brand recognition is deliberately slower and conservative. It
-            # only emits a make after a visible logo agrees across frames.
             if (
-                self.brand_service.model is not None
-                and track.vehicle_class != "motorcycle"
-                and (track.frame_count + tid * 7) % self.brand_interval_frames == 1
+                not tracked.predicted and self.classifier is not None and self.classifier.available
+                and self._is_interval_due(track.frame_count, self.classification_interval_frames)
             ):
                 stage_started = time.perf_counter()
-                observation = await _run_compute(
-                    self.brand_service.recognize_details, vehicle_crop
-                )
-                stage_latency["brand"] += (time.perf_counter() - stage_started) * 1000
-                history = self._brand_histories.setdefault(tid, [])
-                self._brand_histories[tid] = self.brand_service.update_voting(history, observation)
-                brand_result = self.brand_service.resolve_brand(self._brand_histories[tid])
-                await self.track_state.update_brand(
-                    tid,
-                    brand_result["brand"],
-                    brand_result["confidence"],
-                    self._brand_histories[tid],
-                )
-                await self.track_state.update_diagnostics(
-                    tid,
-                    brand={
-                        "status": "recognized" if brand_result["brand"] != "unknown" else "uncertain",
-                        "value": brand_result["brand"],
-                        "candidate_value": brand_result.get("candidate_brand"),
-                        "confidence": round(brand_result["confidence"], 3),
-                        "engine": "brandeye_logo_detector",
-                        "support_count": brand_result["support_count"],
-                        "sample_count": brand_result["sample_count"],
-                        "distribution": brand_result["distribution"],
-                        "provisional": brand_result.get("provisional", True),
-                    },
-                )
-                self.stage_counts[
-                    "brands_recognized" if brand_result["brand"] != "unknown" else "brands_uncertain"
-                ] += 1
+                classification = await _run_compute(self.classifier.classify, analysis_crop)
+                stage_latency["classification"] += (time.perf_counter() - stage_started) * 1000
+                await self.track_state.update_attributes(tid, classification=classification)
+                self.stage_counts["objects_classified"] += int(classification["status"] == "classified")
 
-            # ── Plate detection + OCR ──────────────────────────────
-            # Keep sampling plate crops for the full lifetime of the track.
-            # OCR may finish early, while a much clearer crop often appears
-            # later as the vehicle approaches the camera.
-            plate_sample_due = self._is_interval_due(
-                track.frame_count, self.plate_interval_frames
-            )
-            should_detect_plate = plate_sample_due
-            should_run_ocr = plate_sample_due and track.plate_status != "verified"
-            stage_started = time.perf_counter()
-            plate_detections = (
-                await _run_compute(self.plate_detector.detect, vehicle_crop)
-                if should_detect_plate else []
-            )
-            if should_detect_plate:
-                stage_latency["plate_detection"] += (time.perf_counter() - stage_started) * 1000
-            best_plate_det = self.plate_detector.get_best_plate(plate_detections)
-
-            if not should_detect_plate:
-                best_plate_det = None
-            elif best_plate_det and best_plate_det.crop is not None:
-                self.stage_counts["plates_detected"] += 1
-                plate_quality = self.quality_service.check_plate_crop(best_plate_det.crop)
-                plate_h, plate_w = best_plate_det.crop.shape[:2]
-                crop_score = self._score_plate_crop(
-                    best_plate_det.crop,
-                    float(best_plate_det.confidence),
-                )
-                # Avoid rewriting near-identical frames, but replace the
-                # evidence whenever quality improves materially.
-                improvement_margin = max(0.01, track.best_plate_crop_score * 0.015)
-                is_best_plate_crop = (
-                    track.best_plate_crop_score <= 0.0
-                    or crop_score > track.best_plate_crop_score + improvement_margin
-                )
-                crop_saved = True
-                if (
-                    self.save_crops and not self.anonymization_mode
-                    and settings.STORAGE_PATH
-                    and is_best_plate_crop
-                ):
-                    crop_saved = bool(
-                        await self._save_plate_crop(tid, best_plate_det.crop, track)
-                    )
-                if is_best_plate_crop and crop_saved:
-                    track.best_plate_crop_score = crop_score
-                    best_crop_diagnostics = dict(
-                        track.recognition_diagnostics.get("plate") or {}
-                    )
-                    best_crop_diagnostics.update({
-                        "best_crop_score": round(crop_score, 3),
-                        "best_crop_quality_score": round(plate_quality.overall_score, 3),
-                        "best_crop_size": [plate_w, plate_h],
-                        "best_crop_detector_confidence": round(best_plate_det.confidence, 3),
-                    })
-                    if track.plate_status == "verified":
-                        best_crop_diagnostics.update({
-                            "crop_size": [plate_w, plate_h],
-                            "quality_score": round(plate_quality.overall_score, 3),
-                            "detector_confidence": round(best_plate_det.confidence, 3),
-                        })
-                    await self.track_state.update_diagnostics(
-                        tid, plate=best_crop_diagnostics
-                    )
-
-                # Small and stacked motorcycle plates are often below the
-                # conservative quality gate, but upscaling can still yield
-                # useful OCR. Only reject crops that are truly unusable.
-                recoverable_small_crop = plate_w >= 20 and plate_h >= 12
-                ocr_eligible = plate_quality.is_good or recoverable_small_crop
-                effective_quality = max(0.25, plate_quality.overall_score)
-
-                if should_run_ocr and ocr_eligible:
-                    self.stage_counts["plates_quality_passed"] += 1
-                    stage_started = time.perf_counter()
-                    ocr_result = await _run_compute(
-                        self.ocr.run_ocr,
-                        best_plate_det.crop,
-                        quality_score=effective_quality,
-                    )
-                    stage_latency["ocr"] += (time.perf_counter() - stage_started) * 1000
-
-                    if ocr_result and ocr_result.text:
-                        self.stage_counts["ocr_text_results"] += 1
-                        if tid not in self._ocr_candidates:
-                            self._ocr_candidates[tid] = []
-
-                        self._ocr_candidates[tid] = self.ocr.update_voting(
-                            self._ocr_candidates[tid],
-                            ocr_result,
-                            quality_score=effective_quality,
-                        )
-
-                        voting_result = self.ocr.resolve_plate(
-                            self._ocr_candidates[tid],
-                            total_frames=track.frame_count,
-                        )
-
-                        old_status = track.plate_status
-                        await self.track_state.update_plate(
-                            tid,
-                            plate=voting_result.final_plate,
-                            plate_status=voting_result.status,
-                            plate_confidence=voting_result.confidence,
-                            ocr_candidates=self._ocr_candidates[tid],
-                        )
-                        await self.track_state.update_diagnostics(
-                            tid,
-                            plate={**(track.recognition_diagnostics.get("plate") or {}),
-                                "status": voting_result.status,
-                                "reason": "regex_valid" if ocr_result.regex_valid else "regex_pending",
-                                "detector_confidence": round(best_plate_det.confidence, 3),
-                                "ocr_confidence": round(ocr_result.confidence, 3),
-                                "quality_score": round(plate_quality.overall_score, 3),
-                                "crop_size": [plate_w, plate_h],
-                                "profile": self.ocr.regex_profile,
-                                "upscaled": not plate_quality.is_good,
-                            },
-                        )
-
-                        # Fire event when plate gets verified
-                        if old_status != "verified" and voting_result.status == "verified":
-                            await self._fire_event("plate_verified", track, frame)
-
-                    elif not self._ocr_candidates.get(tid) and (
-                        is_best_plate_crop or not track.recognition_diagnostics.get("plate")
-                    ):
-                        self.stage_counts["ocr_no_text"] += 1
-                        await self.track_state.update_diagnostics(
-                            tid,
-                            plate={**(track.recognition_diagnostics.get("plate") or {}),
-                                "status": "searching",
-                                "reason": "ocr_no_text",
-                                "detector_confidence": round(best_plate_det.confidence, 3),
-                                "quality_score": round(plate_quality.overall_score, 3),
-                                "crop_size": [plate_w, plate_h],
-                                "profile": self.ocr.regex_profile,
-                                "upscaled": not plate_quality.is_good,
-                            },
-                        )
-                elif should_run_ocr:
-                    reason = "plate_too_small" if "too small" in plate_quality.reason else "plate_quality_rejected"
-                    self.stage_counts[reason] += 1
-                    if not self._ocr_candidates.get(tid) and (
-                        is_best_plate_crop or not track.recognition_diagnostics.get("plate")
-                    ):
-                        await self.track_state.update_diagnostics(
-                            tid,
-                            plate={**(track.recognition_diagnostics.get("plate") or {}),
-                                "status": "searching",
-                                "reason": reason,
-                                "detail": plate_quality.reason,
-                                "detector_confidence": round(best_plate_det.confidence, 3),
-                                "crop_size": [plate_w, plate_h],
-                                "profile": self.ocr.regex_profile,
-                            },
-                        )
-            elif (
-                should_run_ocr
-                and not self._ocr_candidates.get(tid)
-                and track.best_plate_crop_score <= 0.0
+            if (
+                self.ocr is not None and self.ocr.available
+                and self._is_interval_due(track.frame_count, self.ocr_interval_frames)
             ):
-                self.stage_counts["plate_not_found"] += 1
-                await self.track_state.update_diagnostics(
-                    tid,
-                    plate={
-                        "status": "searching",
-                        "reason": "plate_not_found",
-                        "profile": self.ocr.regex_profile,
-                    },
-                )
+                stage_started = time.perf_counter()
+                ocr = await _run_compute(self.ocr.recognize, analysis_crop)
+                stage_latency["ocr"] += (time.perf_counter() - stage_started) * 1000
+                await self.track_state.update_attributes(tid, ocr=ocr)
+                self.stage_counts["ocr_recognized"] += int(ocr["status"] == "recognized")
 
-            # Save the clearest, most complete vehicle view. Detector
-            # confidence alone often prefers a late frame where only a door,
-            # lamp or grille remains inside the image.
-            vehicle_crop_score = self._score_vehicle_crop(
-                vehicle_crop, frame, tracked.bbox, tracked.confidence, best_plate_det
+            if self.re_identifier is not None and self.re_identifier.available:
+                stage_started = time.perf_counter()
+                reid = await _run_compute(self.re_identifier.update, tid, analysis_crop)
+                stage_latency["reid"] += (time.perf_counter() - stage_started) * 1000
+                await self.track_state.update_attributes(tid, reid=reid)
+                self.stage_counts["reid_candidate_matches"] += int(reid["status"] == "candidate_match")
+
+            if self.geo_projector is not None and self.geo_projector.available:
+                stage_started = time.perf_counter()
+                geo = self.geo_projector.project(tracked.bbox, frame.shape, source_frame.shape)
+                stage_latency["geo"] += (time.perf_counter() - stage_started) * 1000
+                await self.track_state.update_attributes(tid, geo=geo)
+                self.stage_counts["geo_projected_objects"] += 1
+
+            # Save the clearest, most complete object crop. Detector confidence
+            # alone can prefer a clipped frame over a better training sample.
+            object_crop_score = self._score_object_crop(
+                object_crop, frame, tracked.bbox, tracked.confidence
             )
             if (
-                self.save_crops and settings.STORAGE_PATH
-                and vehicle_crop_score > track.best_vehicle_crop_score
+                self._is_confirmed_track(track)
+                and settings.STORAGE_PATH
+                and object_crop.size
+                and (not track.best_crop_path or object_crop_score > track.best_crop_score)
             ):
-                stored_crop = vehicle_crop.copy()
-                if self.anonymization_mode and best_plate_det:
-                    px1, py1, px2, py2 = best_plate_det.bbox
-                    region = stored_crop[py1:py2, px1:px2]
-                    if region.size:
-                        stored_crop[py1:py2, px1:px2] = cv2.GaussianBlur(region, (31, 31), 0)
-                await self._save_vehicle_crop(tid, stored_crop, track)
-                track.best_vehicle_crop_score = vehicle_crop_score
+                stored_crop = object_crop.copy()
+                await self._save_object_crop(tid, stored_crop, track)
+                track.best_crop_score = object_crop_score
+
+            # A confirmed object is the product record. Persist it after its
+            # evidence crop is available; lifecycle labels stay internal.
+            if (
+                not tracked.predicted
+                and not track.events_fired.get("object_entered")
+                and self._is_confirmed_track(track)
+            ):
+                await self._fire_event("object_entered", track, frame)
+                await self.track_state.mark_event_fired(tid, "object_entered")
 
             # Sync to Redis
             updated_track = await self.track_state.get_track(tid)
             if updated_track:
                 redis_tracks.append(updated_track)
                 ws_objects.append(updated_track.to_ws_dict())
+                if updated_track.frame_count % 30 == 0:
+                    await self._fire_event("track_checkpoint", updated_track, None)
 
         stage_started = time.perf_counter()
         await self.track_state.sync_many_to_redis(redis_tracks)
         stage_latency["redis"] += (time.perf_counter() - stage_started) * 1000
 
-        # ── 4. Remove stale tracks ────────────────────────────────
+        # в”Ђв”Ђ 4. Remove stale tracks в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
         stale = await self.track_state.remove_stale_tracks(active_ids, time.time())
         for stale_track in stale:
-            await self._fire_event("vehicle_left", stale_track, None)
+            if stale_track.events_fired.get("object_entered"):
+                await self._fire_event("object_left", stale_track, None)
             await self.track_state.remove_from_redis(stale_track)
-            # Clean up voting state
-            self._ocr_candidates.pop(stale_track.track_id, None)
-            self._color_histories.pop(stale_track.track_id, None)
-            self._brand_histories.pop(stale_track.track_id, None)
 
-        # ── 5. FPS calculation ────────────────────────────────────
+        # в”Ђв”Ђ 5. FPS calculation в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
         self.fps_counter += 1
         elapsed = time.time() - self._fps_time
         if elapsed >= 1.0:
@@ -649,10 +621,134 @@ class InferencePipeline:
             "stage_counts": dict(self.stage_counts),
             "resolved_pipeline": self.resolved_pipeline,
             "objects": ws_objects,
+            "segments": segments,
         }
 
     @staticmethod
-    def _crop_source_vehicle(
+    def _normalize_target_classes(classes: Optional[List[str]]) -> List[str]:
+        normalized = [str(item).strip().lower() for item in (classes or []) if str(item).strip()]
+        if any(item in {"*", "all", "all_classes"} for item in normalized):
+            return []
+        return normalized
+
+    def _filter_detections(self, detections: List[Detection], frame_shape: tuple) -> List[Detection]:
+        frame_h, frame_w = frame_shape[:2]
+        frame_area = max(1, frame_w * frame_h)
+        kept: List[Detection] = []
+        rejected = 0
+        for detection in detections:
+            x1, y1, x2, y2 = detection.bbox
+            width = max(0, x2 - x1)
+            height = max(0, y2 - y1)
+            if width < self.detection_filters["min_box_width"] or height < self.detection_filters["min_box_height"]:
+                rejected += 1
+                continue
+            area_ratio = (width * height) / frame_area
+            if area_ratio < self.detection_filters["min_box_area_ratio"]:
+                rejected += 1
+                continue
+            if area_ratio > self.detection_filters["max_box_area_ratio"]:
+                rejected += 1
+                continue
+            aspect = max(width / max(height, 1), height / max(width, 1))
+            if aspect > self.detection_filters["max_box_aspect_ratio"]:
+                rejected += 1
+                continue
+            kept.append(detection)
+        if rejected:
+            self.stage_counts["detections_rejected_geometry"] += rejected
+        return kept
+
+    def _suppress_duplicate_tracks(self, tracks: List[TrackedObject]) -> List[TrackedObject]:
+        """Keep the detector as source of truth and hide code-generated duplicates."""
+        observed: List[TrackedObject] = []
+        predicted: List[TrackedObject] = []
+        for track in tracks:
+            (predicted if track.predicted else observed).append(track)
+
+        kept_observed: List[TrackedObject] = []
+        for track in sorted(observed, key=self._track_rank, reverse=True):
+            if any(self._duplicate_observed_track(track, kept) for kept in kept_observed):
+                continue
+            kept_observed.append(track)
+
+        kept_predicted: List[TrackedObject] = []
+        for track in sorted(predicted, key=self._track_rank, reverse=True):
+            if any(self._same_physical_track(track, kept) for kept in kept_observed):
+                continue
+            if any(self._same_physical_track(track, kept) for kept in kept_predicted):
+                continue
+            kept_predicted.append(track)
+
+        return sorted(kept_observed + kept_predicted, key=lambda item: item.track_id)
+
+    @classmethod
+    def _duplicate_observed_track(cls, left: TrackedObject, right: TrackedObject) -> bool:
+        if cls._class_group(left.class_name) != cls._class_group(right.class_name):
+            return False
+        return cls._bbox_iou(left.bbox, right.bbox) >= 0.45 or cls._contained_overlap(left.bbox, right.bbox) >= 0.78
+
+    @classmethod
+    def _same_physical_track(cls, left: TrackedObject, right: TrackedObject) -> bool:
+        if cls._class_group(left.class_name) != cls._class_group(right.class_name):
+            return False
+        iou = cls._bbox_iou(left.bbox, right.bbox)
+        contained = cls._contained_overlap(left.bbox, right.bbox)
+        center_score = cls._center_continuity_score(left.bbox, right.bbox)
+        return iou >= 0.18 or contained >= 0.70 or center_score >= 0.72
+
+    @staticmethod
+    def _class_group(class_name: str) -> str:
+        normalized = (class_name or "unknown").strip().lower() or "unknown"
+        vehicle_like = {"bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat"}
+        return "vehicle_like" if normalized in vehicle_like else normalized
+
+    @classmethod
+    def _track_rank(cls, track: TrackedObject) -> tuple:
+        return (not track.predicted, float(track.confidence), cls._bbox_area(track.bbox))
+
+    @staticmethod
+    def _bbox_area(box: List[int]) -> float:
+        return float(max(0, box[2] - box[0]) * max(0, box[3] - box[1]))
+
+    @classmethod
+    def _bbox_iou(cls, left: List[int], right: List[int]) -> float:
+        x1, y1 = max(left[0], right[0]), max(left[1], right[1])
+        x2, y2 = min(left[2], right[2]), min(left[3], right[3])
+        intersection = max(0, x2 - x1) * max(0, y2 - y1)
+        union = cls._bbox_area(left) + cls._bbox_area(right) - intersection
+        return float(intersection / union) if union > 0 else 0.0
+
+    @classmethod
+    def _contained_overlap(cls, left: List[int], right: List[int]) -> float:
+        x1, y1 = max(left[0], right[0]), max(left[1], right[1])
+        x2, y2 = min(left[2], right[2]), min(left[3], right[3])
+        intersection = max(0, x2 - x1) * max(0, y2 - y1)
+        return float(intersection / max(1.0, min(cls._bbox_area(left), cls._bbox_area(right))))
+
+    @staticmethod
+    def _center_continuity_score(left: List[int], right: List[int]) -> float:
+        left_w, left_h = max(1, left[2] - left[0]), max(1, left[3] - left[1])
+        right_w, right_h = max(1, right[2] - right[0]), max(1, right[3] - right[1])
+        left_center = ((left[0] + left[2]) / 2, (left[1] + left[3]) / 2)
+        right_center = ((right[0] + right[2]) / 2, (right[1] + right[3]) / 2)
+        distance = float(np.hypot(left_center[0] - right_center[0], left_center[1] - right_center[1]))
+        size_gate = max(50.0, 0.55 * max(left_w, left_h, right_w, right_h))
+        if distance > size_gate:
+            return 0.0
+        area_ratio = (left_w * left_h) / max(1, right_w * right_h)
+        if area_ratio < 0.18 or area_ratio > 5.5:
+            return 0.0
+        return 1.0 - (distance / size_gate)
+
+    def _is_confirmed_track(self, track: ActiveTrack) -> bool:
+        return (
+            track.frame_count >= self.min_track_frames_for_event
+            and track.duration_seconds >= self.min_track_duration_seconds
+        )
+
+    @staticmethod
+    def _crop_source_object(
         analysis_frame: np.ndarray,
         source_frame: np.ndarray,
         bbox: List[int],
@@ -671,12 +767,11 @@ class InferencePipeline:
         return source_frame[sy1:sy2, sx1:sx2].copy()
 
     @staticmethod
-    def _score_vehicle_crop(
+    def _score_object_crop(
         crop: np.ndarray,
         analysis_frame: np.ndarray,
         bbox: List[int],
         detection_confidence: float,
-        plate_detection=None,
     ) -> float:
         """Score size, sharpness and completeness instead of confidence alone."""
         if crop is None or crop.size == 0:
@@ -693,14 +788,12 @@ class InferencePipeline:
         completeness_score = max(0.15, 1.0 - edge_hits * 0.28)
         aspect = crop_w / max(crop_h, 1)
         aspect_score = 1.0 if 0.75 <= aspect <= 3.5 else 0.55
-        plate_bonus = 1.0 if plate_detection is not None else 0.0
         return float(np.clip(
-            detection_confidence * 0.22
-            + size_score * 0.22
-            + sharpness_score * 0.20
-            + completeness_score * 0.24
-            + aspect_score * 0.05
-            + plate_bonus * 0.07,
+            detection_confidence * 0.28
+            + size_score * 0.24
+            + sharpness_score * 0.22
+            + completeness_score * 0.21
+            + aspect_score * 0.05,
             0.0,
             1.0,
         ))
@@ -710,95 +803,45 @@ class InferencePipeline:
         """Sample frame 1 and then every configured interval, including interval=1."""
         return (max(1, int(frame_count)) - 1) % max(1, int(interval)) == 0
 
-    @staticmethod
-    def _score_plate_crop(crop: np.ndarray, detection_confidence: float) -> float:
-        """Rank plate evidence by readable detail, not by first detection time."""
-        if crop is None or crop.size == 0:
-            return 0.0
-
-        height, width = crop.shape[:2]
-        gray = (
-            cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-            if len(crop.shape) == 3 else crop
-        )
-        blur = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-        contrast = float(gray.std())
-        brightness = float(gray.mean())
-        aspect = width / max(height, 1)
-
-        # Width and character height are the strongest predictors that the
-        # stored crop will remain useful when enlarged in the UI.
-        resolution_score = float(np.sqrt(
-            min(1.0, width / 180.0) * min(1.0, height / 50.0)
-        ))
-        sharpness_score = min(1.0, np.log1p(max(0.0, blur)) / np.log1p(700.0))
-        contrast_score = min(1.0, contrast / 60.0)
-        brightness_score = max(0.0, 1.0 - abs(brightness - 128.0) / 128.0)
-        aspect_score = 1.0 if 1.5 <= aspect <= 8.0 else 0.35
-
-        return float(np.clip(
-            resolution_score * 0.35
-            + sharpness_score * 0.25
-            + contrast_score * 0.10
-            + brightness_score * 0.08
-            + aspect_score * 0.07
-            + float(np.clip(detection_confidence, 0.0, 1.0)) * 0.15,
-            0.0,
-            1.0,
-        ))
 
     @staticmethod
     def _build_overlay_label(obj: dict) -> str:
         """Build a compact label using characters supported by OpenCV."""
         track_id = obj.get("track_id", "-")
-        plate = obj.get("plate")
-        plate_status = obj.get("plate_status", "searching")
-        plate_confidence = float(obj.get("plate_confidence") or 0.0)
-        color = str(obj.get("color") or "unknown").upper()
 
-        parts = [f"#{track_id}"]
-        if plate:
-            parts.append(str(plate) if plate_status == "verified" else f"~{plate}")
-            if plate_confidence > 0:
-                parts.append(f"{plate_confidence:.0%}")
-        else:
-            parts.append("SEARCHING")
-        if color != "UNKNOWN":
-            parts.append(color)
+        object_class = obj.get("object_class")
+        parts = [f"#{track_id}", str(object_class).upper()] if object_class else [f"#{track_id}"]
+        if obj.get("predicted"):
+            parts.append("PREDICTED")
+            return " | ".join(parts)
         return " | ".join(parts)
 
     def draw_overlay(self, frame: np.ndarray, metadata: Optional[dict]) -> np.ndarray:
         """Draw readable, low-noise bounding boxes and labels on a frame."""
-        if not metadata or not metadata.get("objects"):
+        if not metadata or (not metadata.get("objects") and not metadata.get("segments")):
             return frame
 
         overlay = frame.copy()
         frame_h, frame_w = overlay.shape[:2]
         font = cv2.FONT_HERSHEY_SIMPLEX
         font_scale = 0.46 if frame_w <= 1280 else 0.50
-        color_map = {
-            "red": (0, 0, 220),
-            "blue": (220, 100, 0),
-            "green": (0, 180, 0),
-            "yellow": (0, 220, 220),
-            "orange": (0, 140, 255),
-            "white": (230, 230, 230),
-            "black": (40, 40, 40),
-            "gray": (140, 140, 140),
-            "silver": (192, 192, 192),
-            "brown": (42, 42, 165),
-            "beige": (170, 200, 210),
-            "unknown": (100, 100, 100),
-        }
+        accent = (80, 220, 120)
 
-        for obj in metadata["objects"]:
+        for segment in metadata.get("segments", []):
+            polygon = np.asarray(segment.get("polygon") or [], dtype=np.int32)
+            if len(polygon) < 3:
+                continue
+            mask_layer = overlay.copy()
+            cv2.fillPoly(mask_layer, [polygon], (70, 170, 255))
+            cv2.addWeighted(mask_layer, 0.22, overlay, 0.78, 0, overlay)
+            cv2.polylines(overlay, [polygon], True, (70, 170, 255), 2)
+
+        for obj in metadata.get("objects", []):
             bbox = obj.get("bbox") or []
             if len(bbox) < 4:
                 continue
 
             x1, y1, x2, y2 = [int(value) for value in bbox]
-            color = obj.get("color", "unknown")
-            accent = color_map.get(color, (100, 100, 100))
             cv2.rectangle(overlay, (x1, y1), (x2, y2), accent, 2)
 
             label = self._build_overlay_label(obj)
@@ -841,7 +884,7 @@ class InferencePipeline:
         fps_label = (
             f"FPS {float(metadata.get('fps', 0)):.1f} | "
             f"LAT {float(metadata.get('latency_ms', 0)):.0f} ms | "
-            f"VEHICLES {len(metadata['objects'])}"
+            f"OBJECTS {len(metadata['objects'])}"
         )
         (stats_w, stats_h), stats_base = cv2.getTextSize(fps_label, font, 0.52, 1)
         stats_right = min(frame_w, 10 + stats_w + 18)
@@ -868,45 +911,28 @@ class InferencePipeline:
         """Close remaining tracks when a finite recording reaches EOF."""
         remaining = await self.track_state.remove_all_tracks()
         for track in remaining:
-            await self._fire_event("vehicle_left", track, None)
+            if track.events_fired.get("object_entered"):
+                await self._fire_event(
+                    "object_left",
+                    track,
+                    None,
+                )
             await self.track_state.remove_from_redis(track)
-        self._ocr_candidates.clear()
-        self._color_histories.clear()
-        self._brand_histories.clear()
 
-    async def _save_vehicle_crop(self, track_id: int, crop: np.ndarray, track: ActiveTrack):
+    async def _save_object_crop(self, track_id: int, crop: np.ndarray, track: ActiveTrack):
         try:
             path = os.path.join(
                 settings.CROPS_PATH,
-                f"vehicle_{self.camera_id}_{self.processing_run_id}_{track_id}.jpg",
+                f"object_{self.camera_id}_{self.processing_run_id}_{track_id}.jpg",
             )
             os.makedirs(os.path.dirname(path), exist_ok=True)
             await asyncio.to_thread(
                 cv2.imwrite, path, crop, [cv2.IMWRITE_JPEG_QUALITY, 85]
             )
-            await self.track_state.update_crops(track_id, vehicle_crop_path=path)
+            await self.track_state.update_crops(track_id, crop_path=path)
         except Exception as e:
-            logger.debug(f"Save vehicle crop error: {e}")
+            logger.debug(f"Save object crop error: {e}")
 
-    async def _save_plate_crop(
-        self, track_id: int, crop: np.ndarray, track: ActiveTrack
-    ) -> Optional[str]:
-        try:
-            path = os.path.join(
-                settings.CROPS_PATH,
-                f"plate_{self.camera_id}_{self.processing_run_id}_{track_id}.jpg",
-            )
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            written = await asyncio.to_thread(
-                cv2.imwrite, path, crop, [cv2.IMWRITE_JPEG_QUALITY, 90]
-            )
-            if not written:
-                return None
-            await self.track_state.update_crops(track_id, plate_crop_path=path)
-            return path
-        except Exception as e:
-            logger.debug(f"Save plate crop error: {e}")
-            return None
 
     async def _fire_event(self, event_type: str, track: ActiveTrack, frame: Optional[np.ndarray]):
         """Queue event for database write (non-blocking)."""
@@ -923,11 +949,30 @@ class InferencePipeline:
                     cv2.imwrite, frame_path, frame, [cv2.IMWRITE_JPEG_QUALITY, 75]
                 )
 
+            payload = {
+                "camera_id": self.camera_id,
+                "track_id": track.track_id,
+                "object_class": track.object_class,
+                "detection_confidence": round(track.best_detection_conf, 3),
+                "trajectory": track.trajectory,
+                "speed_pixels_per_second": round(track.speed_pixels_per_second, 3),
+                "direction_degrees": track.direction_degrees,
+                "state": track.state,
+                "predicted": track.predicted,
+                "processing_run_id": self.processing_run_id,
+                "first_seen": track.first_seen,
+                "last_seen": track.last_seen,
+                "duration_seconds": track.duration_seconds,
+                "attributes": track.attributes,
+                "best_crop_path": track.best_crop_path,
+                "last_bbox": track.bbox,
+                "first_video_timestamp_seconds": track.first_video_timestamp_seconds,
+                "last_video_timestamp_seconds": track.last_video_timestamp_seconds,
+            }
             await event_queue.put({
                 "camera_id": self.camera_id,
-                "vehicle_track_id": track.db_track_id,
                 "event_type": event_type,
-                "payload_json": track.to_dict(),
+                "payload_json": payload,
                 "frame_path": frame_path,
             })
         except Exception as e:

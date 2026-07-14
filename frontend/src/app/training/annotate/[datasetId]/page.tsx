@@ -457,6 +457,43 @@ export default function AnnotatePage() {
     finally { setAutoAnnotating(false) }
   }
 
+  const updateFrameStatus = async (status: string, reason: string, priority = 0) => {
+    if (!currentImage) return
+    try {
+      await trainingApi.patch(`/datasets/${datasetId}/images/${currentImage.id}/status`, {
+        status,
+        review_reason: reason,
+        review_priority: priority,
+      })
+      setImages(prev => prev.map(image => image.id === currentImage.id
+        ? { ...image, frame_status: status as any, review_reason: reason, review_priority: priority }
+        : image))
+      toast.success(t('Frame status updated'))
+    } catch {
+      toast.error(t('Failed to update frame status'))
+    }
+  }
+
+  const markHardNegative = async () => {
+    if (!currentImage) return
+    try {
+      await trainingApi.post('/active-learning', {
+        dataset_id: datasetId,
+        image_id: currentImage.id,
+        reason: 'hard_negative',
+        priority_score: 85,
+        source: 'manual_review',
+        details: { filename: currentImage.filename },
+      })
+      setImages(prev => prev.map(image => image.id === currentImage.id
+        ? { ...image, frame_status: 'hard_negative' as any, review_reason: 'hard_negative', review_priority: 85 }
+        : image))
+      toast.success(t('Added to hard negatives'))
+    } catch {
+      toast.error(t('Failed to add hard negative'))
+    }
+  }
+
   const navigate = (dir: -1 | 1) => {
     const next = currentIdx + dir
     if (next >= 0 && next < images.length) setCurrentIdx(next)
@@ -601,6 +638,16 @@ export default function AnnotatePage() {
               )}
             </div>
             <div className="flex items-center gap-2">
+              <button onClick={() => updateFrameStatus('approved', 'human_approved', 0)}
+                title={t('Approve frame')} aria-label={t('Approve frame')}
+                className="px-2 py-1.5 rounded bg-emerald-500/10 text-emerald-400 text-xs hover:bg-emerald-500/20">
+                {t('Approve')}
+              </button>
+              <button onClick={markHardNegative}
+                title={t('Mark hard negative')} aria-label={t('Mark hard negative')}
+                className="px-2 py-1.5 rounded bg-amber-500/10 text-amber-400 text-xs hover:bg-amber-500/20">
+                {t('Hard negative')}
+              </button>
               <button onClick={() => setZoom(z => Math.max(0.25, z - 0.25))} title={t('Zoom out')} aria-label={t('Zoom out')}
                 className="p-1.5 rounded text-muted-foreground hover:text-foreground">
                 <ZoomOut className="w-4 h-4" />

@@ -72,6 +72,18 @@ class ModelRegistryService:
                 "success": False,
                 "error": "Model must pass dataset validation before deployment",
             }
+        if mv.gate_result == "rejected":
+            return {
+                "success": False,
+                "error": "Model was rejected by the decision gate",
+                "gate_reasons": mv.gate_reasons or [],
+            }
+        if mv.gate_result == "candidate":
+            return {
+                "success": False,
+                "error": "Candidate model needs stronger evaluation before production deployment",
+                "gate_reasons": mv.gate_reasons or [],
+            }
 
         # Auto tests before deploy
         if approval.run_auto_tests:
@@ -204,10 +216,9 @@ class ModelRegistryService:
 
         # Determine destination in inference models dir
         type_to_dir = {
-            "vehicle_detector": "vehicle_detector",
-            "plate_detector": "plate_detector",
-            "color_classifier": "color_classifier",
-            "ocr": "ocr",
+            "object_detector": "object_detector",
+            "object_segmenter": "object_segmenter",
+            "object_classifier": "object_classifier",
         }
         subdir = type_to_dir.get(mv.model_type, mv.model_type)
         dest_dir = Path(settings.INFERENCE_MODELS_PATH) / subdir
@@ -222,6 +233,12 @@ class ModelRegistryService:
         if mv.onnx_path and os.path.exists(mv.onnx_path):
             onnx_dest = dest_dir / "production.onnx"
             self._atomic_copy(Path(mv.onnx_path), onnx_dest)
+        if mv.model_type == "object_classifier":
+            labels = (mv.artifact_metadata or {}).get("classes") or []
+            labels_path = dest_dir / "labels.json"
+            temp_labels = labels_path.with_suffix(".json.tmp")
+            temp_labels.write_text(json.dumps({"classes": labels}, indent=2) + "\n", encoding="utf-8")
+            os.replace(temp_labels, labels_path)
 
         # Copy TRT if available
         if mv.trt_path and os.path.exists(mv.trt_path):

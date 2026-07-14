@@ -5,7 +5,7 @@ from typing import Optional, List
 
 class TrainingSettings(BaseSettings):
     # App
-    APP_NAME: str = "VTP Training Platform"
+    APP_NAME: str = "BEVP Training Platform"
     APP_VERSION: str = "1.0.0"
     DEBUG: bool = False
     APP_ENV: str = "development"
@@ -17,8 +17,8 @@ class TrainingSettings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24
 
     # Database — same PostgreSQL, separate schema
-    DATABASE_URL: str = "postgresql+asyncpg://vtp_user:vtp_pass@postgres:5432/vtp_db"
-    DATABASE_SYNC_URL: str = "postgresql://vtp_user:vtp_pass@postgres:5432/vtp_db"
+    DATABASE_URL: str = "postgresql+asyncpg://bevp_user:bevp_pass@postgres:5432/bevp_db"
+    DATABASE_SYNC_URL: str = "postgresql://bevp_user:bevp_pass@postgres:5432/bevp_db"
 
     # Redis — same Redis instance, different DB index
     REDIS_URL: str = "redis://redis:6379/1"
@@ -30,6 +30,7 @@ class TrainingSettings(BaseSettings):
     DATASETS_PATH: str = "/app/data/datasets"
     UPLOADS_PATH: str = "/app/data/uploads"
     MODELS_PATH: str = "/app/data/models"
+    TRAINED_MODELS_PATH: str = "/app/data/models/new"
     EXPORTS_PATH: str = "/app/data/exports"
     LOGS_PATH: str = "/app/data/logs"
 
@@ -46,7 +47,7 @@ class TrainingSettings(BaseSettings):
 
     # CORS
     CORS_ORIGINS: List[str] = [
-        "http://localhost:3000",
+        "http://localhost:3100",
         "http://frontend:3000",
     ]
 

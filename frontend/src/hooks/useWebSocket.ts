@@ -1,8 +1,7 @@
 'use client'
 import { useEffect, useRef, useState, useCallback } from 'react'
 import { WSFrame } from '@/types'
-
-const WS_URL = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8000'
+import { WS_URL } from '@/lib/api'
 
 interface UseWebSocketOptions {
   cameraId: number
@@ -20,7 +19,7 @@ export function useWebSocket({ cameraId, onFrame, onAlert, enabled = true }: Use
 
   const connect = useCallback(() => {
     if (!enabled) return
-    const token = localStorage.getItem('vtp_token')
+    const token = localStorage.getItem('bevp_token')
     if (!token) return
 
     const url = `${WS_URL}/ws/live/${cameraId}?token=${token}`

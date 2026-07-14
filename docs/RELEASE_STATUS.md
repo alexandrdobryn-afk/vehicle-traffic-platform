@@ -1,32 +1,28 @@
-# Release readiness
+# Release status
 
-Updated: 2026-07-05.
+BEVP currently provides a development baseline for aerial small-object analysis.
 
-## Verified in the current development environment
+Available:
 
-- Docker Compose starts the frontend, inference backend, PostgreSQL, Redis and training services.
-- The inference backend runs on CPU and on NVIDIA CUDA; the runtime status screen reports the effective provider and hardware.
-- Uploaded video processing, annotated preview, rerun and end-of-file lifecycle work end to end.
-- Vehicle tracking, plate detection, temporal OCR voting, regional syntax validation, best-frame evidence selection, color voting and conservative vehicle-brand recognition are wired into the runtime pipeline.
-- The UI exposes four core AI presets, three experimental presets and a manual pipeline selector with compatibility warnings.
-- Camera and video recognition thresholds are source-local. Compute provider selection is global.
-- The separate Training API supports dataset annotation, deterministic splits, training jobs, validation, model registry approval and rollback.
-- Vehicle and plate instance-segmentation datasets, YOLO segmentation export and segmenter training paths are implemented.
-- Gemini-assisted capture is opt-in per source, stores only selected real frames, requires human review, and imports approved masks into segmentation datasets.
-- The interface supports Ukrainian and English.
-- Backend recognition tests, Training API integration tests, segmentation schema tests and the Next.js production build pass in the Docker-backed development workflow.
+- live/drone streams and recorded-video processing;
+- source-resolution tiled object detection;
+- configurable object detector and tracker selection;
+- Kalman prediction, optional classification and optional segmentation;
+- persistent object tracks, trajectories, events and runtime performance;
+- dataset annotation, immutable dataset versions, training and model registry;
+- frame review statuses, hard-negative capture and Active Learning queue;
+- validation report storage, generated FP/FN/class-confusion error items, decision gate metadata and Evaluation UI;
+- baseline inference mode for reviewable auto-label generation;
+- physical tiled YOLO training export with tile manifest and original-frame lineage;
+- CPU/CUDA launch policy and C++ ONNX reference runtime;
+- Ukrainian and English operator UI.
 
-## Requires target data or deployment infrastructure
+Not yet release evidence:
 
-- Long-running RTSP/HLS/MJPEG/JPEG soak tests on the actual camera models, including day, night, rain, glare and network interruption scenarios.
-- A frozen labeled evaluation set for detector recall/precision, plate exact match, character accuracy, color macro-F1, brand accuracy and tracking IDF1.
-- Performance benchmarks for each preset on every supported CPU/GPU target. Local FPS figures must not be generalized to other hardware.
-- TensorRT engines built and validated on each target NVIDIA GPU and compatible TensorRT runtime.
-- Retention limits, backup/restore, monitoring, alert-delivery retries and production secret management.
-- A live Gemini provider request with a project-owned API key, plus cost/rate-limit and privacy-policy validation for the intended deployment jurisdiction.
-- Explicit integration and evaluation of approved segmenter artifacts in the live inference/tracking pipeline; registry approval alone does not switch tracking to masks.
-- A project-level license and a documented decision on third-party model and dataset licenses, including Ultralytics terms.
+- target-domain detector accuracy;
+- AP-small/Recall-small, FP/frame and FN/frame acceptance evidence on a frozen aerial holdout;
+- HOTA automation;
+- native TensorRT validation on the deployment GPU;
+- production soak, retention, backup and security acceptance.
 
-## Release classification
-
-This repository is a functional development baseline suitable for controlled testing. It is not yet a production-certified traffic enforcement or safety system.
+No unrelated detector is substituted when an aerial model is missing. Availability is reported from the real artifact registry.

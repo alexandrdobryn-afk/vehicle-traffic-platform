@@ -3,13 +3,71 @@ import { useEffect, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import AppShell from '@/components/shared/AppShell'
 import trainingApi from '@/lib/trainingApi'
-import { TDataset, TArchitecture, ModelType, MODEL_TYPE_LABELS } from '@/types/training'
+import { TDataset, TArchitecture, TBaseModel, ModelType, MODEL_TYPE_LABELS } from '@/types/training'
 import toast from 'react-hot-toast'
-import { ChevronRight, ChevronLeft } from 'lucide-react'
+import { ChevronRight, ChevronLeft, Info } from 'lucide-react'
 import { useTranslation } from '@/lib/i18n'
 
 const STEPS = ['Model & Dataset', 'Architecture', 'Hyperparameters', 'Augmentation', 'Review']
-const MODEL_TYPES: ModelType[] = ['vehicle_detector', 'plate_detector', 'vehicle_segmenter', 'plate_segmenter', 'color_classifier', 'ocr']
+const MODEL_TYPES: ModelType[] = ['object_detector', 'object_segmenter', 'object_classifier']
+const TRAINING_MODES = [
+  {
+    value: 'baseline_inference',
+    label: 'Baseline inference',
+    desc: 'Runs the selected model over frames and creates reviewable predictions without updating weights.',
+    backbone: 'Locked',
+    head: 'Locked',
+    output: 'Annotations only',
+  },
+  {
+    value: 'head_finetune',
+    label: 'Head fine-tuning',
+    desc: 'Freezes the backbone and trains only the task head. Best first step for small verified datasets.',
+    backbone: 'Frozen',
+    head: 'Trainable',
+    output: 'New model candidate',
+  },
+  {
+    value: 'full_finetune',
+    label: 'Full fine-tuning',
+    desc: 'Trains backbone and head from the selected base model. Use when the dataset is broad enough.',
+    backbone: 'Trainable',
+    head: 'Trainable',
+    output: 'New model candidate',
+  },
+  {
+    value: 'tiled_training',
+    label: 'Sliced / tiled training',
+    desc: 'Cuts high-resolution aerial frames into overlapping tiles so small objects occupy more pixels.',
+    backbone: 'Trainable',
+    head: 'Trainable',
+    output: 'Small-object candidate',
+  },
+  {
+    value: 'hard_negative_training',
+    label: 'Hard negative training',
+    desc: 'Adds reviewed empty or rejected frames to reduce false positives on confusing backgrounds.',
+    backbone: 'Trainable',
+    head: 'Trainable',
+    output: 'Lower FP candidate',
+  },
+  {
+    value: 'semi_supervised',
+    label: 'Semi-supervised reviewed labels',
+    desc: 'Uses reviewed pseudo-labels only. Unverified auto-labels remain outside the training export.',
+    backbone: 'Trainable',
+    head: 'Trainable',
+    output: 'Reviewed-label candidate',
+  },
+  {
+    value: 'continual_retraining',
+    label: 'Continual retraining',
+    desc: 'Starts a new controlled run from a previous registry model and increments cumulative epochs.',
+    backbone: 'Trainable',
+    head: 'Trainable',
+    output: 'Next model version',
+  },
+]
 const OPTIMIZERS = ['SGD', 'Adam', 'AdamW']
 const SCHEDULERS = ['cosine', 'linear', 'step', 'none']
 
@@ -19,13 +77,17 @@ export default function NewJobPage() {
   const [step, setStep] = useState(0)
   const [datasets, setDatasets] = useState<TDataset[]>([])
   const [architectures, setArchitectures] = useState<TArchitecture[]>([])
+  const [baseModels, setBaseModels] = useState<TBaseModel[]>([])
   const [submitting, setSubmitting] = useState(false)
+  const [nameTouched, setNameTouched] = useState(false)
 
   const [form, setForm] = useState({
     name: '', description: '',
-    model_type: 'vehicle_detector' as ModelType,
+    model_type: 'object_detector' as ModelType,
     dataset_id: 0,
     architecture: '',
+    base_model_id: '',
+    training_mode: 'full_finetune',
     hyperparams: {
       epochs: 100, batch_size: 16, img_size: 640,
       learning_rate: 0.01, weight_decay: 0.0005,
@@ -44,21 +106,70 @@ export default function NewJobPage() {
       mixup: 0.1, random_crop: true,
       horizontal_flip: 0.5,
     },
+    tile_config: {
+      enabled: true, tile_size: 1024, overlap: 0.2,
+      include_empty_tiles: true, max_empty_tile_ratio: 0.25,
+      min_bbox_area: 0.00001, min_visibility: 0.2,
+    },
+    evaluation_policy: {
+      auto_validate_after_training: true,
+      min_ap_small_delta: 0.05,
+      min_recall_small: 0.65,
+      max_recall_small_drop: 0,
+      max_fp_per_frame: 1,
+      max_fp_per_frame_increase_ratio: 0.1,
+      max_old_holdout_drop: 0.02,
+      small_object_area_threshold: 0.01,
+      error_iou_threshold: 0.5,
+      error_confidence_threshold: 0.25,
+      max_error_items: 300,
+      min_fps: 0,
+      max_latency_p95_ms: '',
+    },
   })
 
   useEffect(() => { trainingApi.get('/datasets').then(r => setDatasets(r.data)) }, [])
 
   useEffect(() => {
     if (form.model_type) {
-      trainingApi.get(`/architectures/${form.model_type}`)
-        .then(r => { setArchitectures(r.data); if (r.data[0]) setForm(f => ({ ...f, architecture: r.data[0].id })) })
+      Promise.all([
+        trainingApi.get(`/architectures/${form.model_type}`),
+        trainingApi.get(`/architectures/${form.model_type}/base-models`),
+      ]).then(([archResponse, baseResponse]) => {
+        const archs = archResponse.data as TArchitecture[]
+        const bases = baseResponse.data as TBaseModel[]
+        const selectedBase = bases.find(model => model.available) || bases[0]
+        setArchitectures(archs)
+        setBaseModels(bases)
+        setForm(f => ({
+          ...f,
+          architecture: selectedBase?.architecture || archs[0]?.id || '',
+          base_model_id: selectedBase?.id || '',
+          dataset_id: 0,
+        }))
+      })
     }
   }, [form.model_type])
 
-  const filteredDatasets = datasets.filter(d => d.model_type === form.model_type)
+  useEffect(() => {
+    if (nameTouched) return
+    const base = baseModels.find(model => model.id === form.base_model_id)
+    if (!base || !form.architecture) return
+    const date = new Date().toISOString().slice(0, 10)
+    const nextVersion = Number(base.training?.cumulative_epochs || 0) > 0
+      ? `epoch-${Number(base.training?.cumulative_epochs || 0) + Number(form.hyperparams.epochs || 0)}`
+      : `epoch-${form.hyperparams.epochs}`
+    const typeLabel = MODEL_TYPE_LABELS[form.model_type].replace('Object ', '').toLowerCase()
+    f('name', `${typeLabel} ${form.architecture} ${nextVersion} ${date}`)
+  }, [baseModels, form.base_model_id, form.architecture, form.hyperparams.epochs, form.model_type, nameTouched])
+
+  const filteredDatasets = datasets.filter(d =>
+    d.model_type === form.model_type &&
+    (form.training_mode === 'baseline_inference' || (d.is_frozen && Boolean(d.content_hash)))
+  )
 
   const handleSubmit = async () => {
-    if (!form.name || !form.dataset_id || !form.architecture) {
+    if (!form.name || !form.dataset_id || !form.architecture || !form.base_model_id) {
       toast.error(t('Please fill all required fields'))
       return
     }
@@ -68,9 +179,16 @@ export default function NewJobPage() {
         name: form.name,
         model_type: form.model_type,
         architecture: form.architecture,
+        base_model_id: form.base_model_id,
         dataset_id: form.dataset_id,
+        training_mode: form.training_mode,
         hyperparams: form.hyperparams,
         augmentation: form.augmentation,
+        tile_config: form.tile_config,
+        evaluation_policy: {
+          ...form.evaluation_policy,
+          max_latency_p95_ms: form.evaluation_policy.max_latency_p95_ms === '' ? null : Number(form.evaluation_policy.max_latency_p95_ms),
+        },
       })
       toast.success(t('Training job created!'))
       router.push(`/training/jobs/${r.data.id}`)
@@ -82,20 +200,25 @@ export default function NewJobPage() {
   const f = (key: string, val: any) => setForm(p => ({ ...p, [key]: val }))
   const hp = (key: string, val: any) => setForm(p => ({ ...p, hyperparams: { ...p.hyperparams, [key]: val } }))
   const aug = (key: string, val: any) => setForm(p => ({ ...p, augmentation: { ...p.augmentation, [key]: val } }))
+  const tile = (key: string, val: any) => setForm(p => ({ ...p, tile_config: { ...p.tile_config, [key]: val } }))
+  const policy = (key: string, val: any) => setForm(p => ({ ...p, evaluation_policy: { ...p.evaluation_policy, [key]: val } }))
 
   const inputCls = "w-full px-3 py-2 bg-background border border-input rounded-lg text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-ring"
   const selectCls = inputCls
   const labelCls = "block text-sm font-medium text-muted-foreground mb-1"
+  const selectedMode = TRAINING_MODES.find(mode => mode.value === form.training_mode) || TRAINING_MODES[0]
+  const selectedBaseModel = baseModels.find(model => model.id === form.base_model_id)
+  const selectedBaseEpochs = Number(selectedBaseModel?.training?.cumulative_epochs || 0)
 
   const canNext = () => {
-    if (step === 0) return !!form.name && !!form.dataset_id
+    if (step === 0) return !!form.name && !!form.dataset_id && !!form.base_model_id
     if (step === 1) return !!form.architecture
     return true
   }
 
   return (
     <AppShell>
-      <div className="p-6 max-w-2xl">
+      <div className="p-6 max-w-6xl">
         {/* Header */}
         <div className="mb-6">
           <h1 className="text-2xl font-bold text-foreground">{t('New Training Job')}</h1>
@@ -121,36 +244,96 @@ export default function NewJobPage() {
         <div className="bg-card border border-border rounded-xl p-6 space-y-4">
           {/* Step 0: Model & Dataset */}
           {step === 0 && (
-            <>
-              <div>
-                <label className={labelCls}>{t('Job Name')} *</label>
-                <input value={form.name} onChange={e => f('name', e.target.value)}
-                  placeholder="YOLO11n Vehicle Detector v2" className={inputCls} />
-              </div>
-              <div>
-                <label className={labelCls}>{t('Model Type')}</label>
-                <select value={form.model_type} onChange={e => f('model_type', e.target.value as ModelType)} className={selectCls}>
-                  {MODEL_TYPES.map(modelType => <option key={modelType} value={modelType}>{t(MODEL_TYPE_LABELS[modelType])}</option>)}
-                </select>
-              </div>
-              <div>
-                <label className={labelCls}>{t('Dataset')} *</label>
-                {filteredDatasets.length === 0 ? (
-                  <p className="text-sm text-amber-400">
-                    {t('No datasets for {type}. Create one first.', { type: t(MODEL_TYPE_LABELS[form.model_type]) })}
-                  </p>
-                ) : (
-                  <select value={form.dataset_id} onChange={e => f('dataset_id', parseInt(e.target.value))} className={selectCls}>
-                    <option value={0}>{t('Select dataset...')}</option>
-                    {filteredDatasets.map(d => (
-                      <option key={d.id} value={d.id}>
-                        {d.name} ({t('{count} images', { count: d.image_count })})
-                      </option>
-                    ))}
+            <div className="grid gap-6 lg:grid-cols-[1fr_320px]">
+              <div className="space-y-4">
+                <div>
+                  <label className={labelCls}>{t('Job Name')} *</label>
+                  <input
+                    value={form.name}
+                    onChange={e => { setNameTouched(true); f('name', e.target.value) }}
+                    placeholder="aerial detector yolo11s epoch-100"
+                    className={inputCls}
+                  />
+                </div>
+                <div>
+                  <label className={labelCls}>{t('Model Type')}</label>
+                  <select value={form.model_type} onChange={e => f('model_type', e.target.value as ModelType)} className={selectCls}>
+                    {MODEL_TYPES.map(modelType => <option key={modelType} value={modelType}>{t(MODEL_TYPE_LABELS[modelType])}</option>)}
                   </select>
-                )}
+                </div>
+                <div>
+                  <label className={labelCls}>{t('Base Model')} *</label>
+                  {baseModels.length === 0 ? (
+                    <p className="text-sm text-amber-400">{t('No base models are available for this type')}</p>
+                  ) : (
+                    <select
+                      value={form.base_model_id}
+                      onChange={e => {
+                        const base = baseModels.find(model => model.id === e.target.value)
+                        setForm(p => ({
+                          ...p,
+                          base_model_id: e.target.value,
+                          architecture: base?.architecture || p.architecture,
+                        }))
+                      }}
+                      className={selectCls}
+                    >
+                      <option value="">{t('Select base model...')}</option>
+                      {baseModels.map(model => (
+                        <option key={model.id} value={model.id} disabled={!model.available}>
+                          {model.label} ({model.source})
+                        </option>
+                      ))}
+                    </select>
+                  )}
+                </div>
+                <div>
+                  <label className={labelCls}>{t('Training Mode')}</label>
+                  <select value={form.training_mode} onChange={e => f('training_mode', e.target.value)} className={selectCls}>
+                    {TRAINING_MODES.map(mode => <option key={mode.value} value={mode.value}>{t(mode.label)}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <label className={labelCls}>{t('Dataset')} *</label>
+                  {filteredDatasets.length === 0 ? (
+                    <p className="text-sm text-amber-400">
+                      {t('No datasets for {type}. Create one first.', { type: t(MODEL_TYPE_LABELS[form.model_type]) })}
+                    </p>
+                  ) : (
+                    <select value={form.dataset_id} onChange={e => f('dataset_id', parseInt(e.target.value))} className={selectCls}>
+                      <option value={0}>{t('Select dataset...')}</option>
+                      {filteredDatasets.map(d => (
+                        <option key={d.id} value={d.id}>
+                          {d.name} ({t('{count} images', { count: d.image_count })})
+                        </option>
+                      ))}
+                    </select>
+                  )}
+                </div>
               </div>
-            </>
+              <aside className="rounded-lg border border-border bg-background/60 p-4">
+                <div className="mb-3 flex items-center gap-2">
+                  <Info className="h-4 w-4 text-primary" />
+                  <p className="text-sm font-semibold text-foreground">{t(selectedMode.label)}</p>
+                </div>
+                <p className="text-sm text-muted-foreground">{t(selectedMode.desc)}</p>
+                <div className="mt-4 space-y-3 text-sm">
+                  {[
+                    ['Backbone', selectedMode.backbone],
+                    ['Head', selectedMode.head],
+                    ['Output', selectedMode.output],
+                    ['Architecture', form.architecture || '-'],
+                    ['Base', selectedBaseModel?.label || '-'],
+                    ['Previous epochs', selectedBaseEpochs],
+                  ].map(([label, value]) => (
+                    <div key={String(label)} className="flex justify-between gap-3 border-t border-border/50 pt-2">
+                      <span className="text-muted-foreground">{t(String(label))}</span>
+                      <span className="text-right font-medium text-foreground">{t(String(value))}</span>
+                    </div>
+                  ))}
+                </div>
+              </aside>
+            </div>
           )}
 
           {/* Step 1: Architecture */}
@@ -163,7 +346,14 @@ export default function NewJobPage() {
                   }`}>
                   <input type="radio" name="arch" value={arch.id}
                     checked={form.architecture === arch.id}
-                    onChange={() => f('architecture', arch.id)} className="mt-1" />
+                    onChange={() => {
+                      const matchingBase = baseModels.find(model => model.architecture === arch.id && model.available)
+                      setForm(p => ({
+                        ...p,
+                        architecture: arch.id,
+                        base_model_id: matchingBase?.id || '',
+                      }))
+                    }} className="mt-1" />
                   <div>
                     <p className="font-medium text-foreground">{arch.name}</p>
                     <p className="text-xs text-muted-foreground">{t(arch.desc)}</p>
@@ -215,6 +405,55 @@ export default function NewJobPage() {
                   </label>
                 ))}
               </div>
+              <div className="col-span-2 rounded-lg border border-border p-4">
+                <div className="mb-3 flex items-center justify-between">
+                  <p className="text-sm font-medium text-foreground">{t('Tiled Training')}</p>
+                  <label className="flex items-center gap-2 text-sm text-muted-foreground">
+                    <input type="checkbox" checked={form.tile_config.enabled}
+                      onChange={e => tile('enabled', e.target.checked)} />
+                    {t('Enabled')}
+                  </label>
+                </div>
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <label className={labelCls}>{t('Tile Size')}</label>
+                    <input type="number" min={320} max={4096} value={form.tile_config.tile_size}
+                      onChange={e => tile('tile_size', Number(e.target.value))} className={inputCls} />
+                  </div>
+                  <div>
+                    <label className={labelCls}>{t('Overlap')}</label>
+                    <input type="number" min={0} max={0.75} step={0.05} value={form.tile_config.overlap}
+                      onChange={e => tile('overlap', Number(e.target.value))} className={inputCls} />
+                  </div>
+                  <div>
+                    <label className={labelCls}>{t('Min Object Visibility')}</label>
+                    <input type="number" min={0.05} max={1} step={0.05} value={form.tile_config.min_visibility}
+                      onChange={e => tile('min_visibility', Number(e.target.value))} className={inputCls} />
+                  </div>
+                  <label className="flex items-center gap-2 text-sm text-muted-foreground">
+                    <input type="checkbox" checked={form.tile_config.include_empty_tiles}
+                      onChange={e => tile('include_empty_tiles', e.target.checked)} />
+                    {t('Include empty hard-negative tiles')}
+                  </label>
+                  <div>
+                    <label className={labelCls}>{t('Max Empty Tile Ratio')}</label>
+                    <input type="number" min={0} max={1} step={0.05} value={form.tile_config.max_empty_tile_ratio}
+                      onChange={e => tile('max_empty_tile_ratio', Number(e.target.value))} className={inputCls} />
+                  </div>
+                </div>
+              </div>
+              <label className="col-span-2 flex items-start gap-2 rounded-lg border border-border p-3 text-sm text-muted-foreground">
+                <input
+                  type="checkbox"
+                  checked={Boolean(form.evaluation_policy.auto_validate_after_training)}
+                  onChange={e => policy('auto_validate_after_training', e.target.checked)}
+                  className="mt-1"
+                />
+                <span>
+                  <span className="block font-medium text-foreground">{t('Create validation report after training')}</span>
+                  <span className="block text-xs">{t('This does not deploy the model or start another training run.')}</span>
+                </span>
+              </label>
             </div>
           )}
 
@@ -265,7 +504,10 @@ export default function NewJobPage() {
               {[
                 ['Job Name', form.name],
                 ['Model Type', MODEL_TYPE_LABELS[form.model_type]],
+                ['Training Mode', form.training_mode],
                 ['Architecture', form.architecture],
+                ['Base Model', selectedBaseModel?.label || '-'],
+                ['Previous epochs', selectedBaseEpochs],
                 ['Dataset', datasets.find(d => d.id === form.dataset_id)?.name || '—'],
                 ['Epochs', form.hyperparams.epochs],
                 ['Batch Size', form.hyperparams.batch_size],
@@ -274,12 +516,45 @@ export default function NewJobPage() {
                 ['Optimizer', form.hyperparams.optimizer],
                 ['Augmentation', form.augmentation.enabled ? 'Enabled' : 'Disabled'],
                 ['Pretrained', form.hyperparams.pretrained ? 'Yes' : 'No'],
+                ['Tile Size', form.tile_config.tile_size],
+                ['Tile Overlap', form.tile_config.overlap],
+                ['Validation report', form.evaluation_policy.auto_validate_after_training ? 'Enabled' : 'Manual only'],
               ].map(([k, v]) => (
                 <div key={String(k)} className="flex justify-between py-1.5 border-b border-border/50 last:border-0">
                   <span className="text-muted-foreground">{t(String(k))}</span>
                   <span className="font-medium text-foreground">{t(String(v))}</span>
                 </div>
               ))}
+              <div className="rounded-lg border border-border p-3">
+                <p className="mb-2 text-xs font-semibold uppercase text-muted-foreground">{t('Decision Gate')}</p>
+                <div className="grid grid-cols-2 gap-3">
+                  {[
+                    ['Min AP-small delta', 'min_ap_small_delta'],
+                    ['Min Recall-small', 'min_recall_small'],
+                    ['Max recall-small drop', 'max_recall_small_drop'],
+                    ['Max FP/frame', 'max_fp_per_frame'],
+                    ['Max FP/frame increase', 'max_fp_per_frame_increase_ratio'],
+                    ['Max old holdout drop', 'max_old_holdout_drop'],
+                    ['Small object area threshold', 'small_object_area_threshold'],
+                    ['Error IoU threshold', 'error_iou_threshold'],
+                    ['Error confidence threshold', 'error_confidence_threshold'],
+                    ['Max error items', 'max_error_items'],
+                    ['Min FPS', 'min_fps'],
+                    ['Max P95 latency ms', 'max_latency_p95_ms'],
+                  ].map(([label, key]) => (
+                    <div key={key}>
+                      <label className={labelCls}>{t(label)}</label>
+                      <input
+                        type="number"
+                        step={key === 'min_fps' || key === 'max_latency_p95_ms' || key === 'max_error_items' ? 1 : 0.01}
+                        value={(form.evaluation_policy as any)[key]}
+                        onChange={e => policy(key, e.target.value === '' ? '' : Number(e.target.value))}
+                        className={inputCls}
+                      />
+                    </div>
+                  ))}
+                </div>
+              </div>
             </div>
           )}
         </div>

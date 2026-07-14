@@ -3,17 +3,17 @@
 # Keep these outside requirements.txt so the stable CPU backend can still build
 # even when a research dependency changes its transitive packages.
 
-# RF-DETR vehicle detector. Official package auto-downloads pretrained weights
+# RF-DETR object detector. Official package auto-downloads pretrained weights
 # for RFDETRNano/RFDETRMedium on first use.
 rfdetr==1.8.3
 
-# PaddleOCR OCR engine. Useful for the Practical / Maximum Accuracy presets,
-# but heavier than EasyOCR and may need PaddlePaddle-specific CPU/GPU wheels.
+# Tracker adapters. ByteTrack/BoT-SORT come from Ultralytics; these packages
+# enable the explicit DeepSORT and OC-SORT runtime choices.
+deep-sort-realtime==1.3.2
+filterpy==1.4.5
+
+# Generic scene-text OCR candidates. Keep OCR optional until the text module is
+# wired for signs, labels, building numbers and markings.
 paddleocr==3.7.0
 paddlepaddle==3.2.2
-
-# Fast ALPR / ONNX OCR placeholder. The runtime adapter is intentionally marked
-# experimental until a concrete package/artifact is selected and benchmarked.
-fast-plate-ocr==1.1.0
-fast-alpr[onnx]==0.4.0
-open-image-models[onnx]==0.5.1
+easyocr==1.7.2

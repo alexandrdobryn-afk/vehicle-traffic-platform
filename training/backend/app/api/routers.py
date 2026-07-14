@@ -13,6 +13,7 @@ from sqlalchemy import select, desc, update, text
 from app.models.database import (
     Dataset, DatasetImage, DatasetVideo, Annotation,
     TrainingJob, TrainingMetrics, ModelVersion, DeployLog,
+    EvaluationReport,
     get_db, JobStatus,
 )
 from app.schemas.schemas import (
@@ -21,16 +22,31 @@ from app.schemas.schemas import (
     TrainingJobCreate, TrainingJobResponse, TrainingMetricsResponse,
     ModelVersionResponse, DeployApproval, RollbackRequest,
     VideoExtractConfig, AutoAnnotateConfig, GeminiCandidateImport,
+    FrameStatusUpdate, ActiveLearningCreate, ActiveLearningStatusUpdate,
+    ActiveLearningItemResponse, EvaluationReportResponse, EvaluationErrorResponse,
 )
 from app.config import settings
 from app.services.dataset_service import dataset_service
 from app.services.annotation_service import annotation_service
 from app.services.model_registry_service import model_registry_service
 from app.services.gpu_service import gpu_service
+from app.services.lifecycle_service import lifecycle_service
 from app.utils.auth import get_current_user, require_operator, require_admin
 
 import logging
 logger = logging.getLogger(__name__)
+
+MODEL_TYPE_DIRS = {
+    "object_detector": "object_detector",
+    "object_segmenter": "object_segmenter",
+    "object_classifier": "object_classifier",
+}
+
+
+def _base_model_display_name(item: dict) -> str:
+    label = item.get("label") or item.get("name") or item.get("id")
+    version = item.get("version")
+    return f"{label} {version}".strip() if version else str(label)
 
 # ═══ DATASETS ════════════════════════════════════════════════════
 datasets_router = APIRouter(prefix="/api/v1/training/datasets", tags=["training-datasets"])
@@ -79,7 +95,7 @@ async def import_gemini_candidates(
                 description="Human-approved Gemini-assisted masks from real platform frames",
                 model_type=ModelTypeEnum(model_type),
                 annotation_type=AnnotationTypeEnum.SEGMENTATION,
-                classes=["car", "truck", "bus", "motorcycle", "van"] if model_type == "vehicle_segmenter" else ["license_plate"],
+                classes=["object"],
                 tags=["gemini-assisted", "human-verified", "real-frames"],
             ),
             user["email"],
@@ -197,6 +213,31 @@ async def dataset_stats(
     return await dataset_service.get_stats(db, dataset_id)
 
 
+@datasets_router.post("/{dataset_id}/freeze", response_model=DatasetResponse)
+async def freeze_dataset_version(
+    dataset_id: int,
+    db: AsyncSession = Depends(get_db),
+    user=Depends(require_operator),
+):
+    try:
+        return await dataset_service.freeze_dataset(db, dataset_id)
+    except ValueError as exc:
+        raise HTTPException(404 if str(exc) == "Dataset not found" else 409, str(exc)) from exc
+
+
+@datasets_router.post("/{dataset_id}/versions", response_model=DatasetResponse)
+async def create_dataset_version(
+    dataset_id: int,
+    version: str = Query(..., min_length=1, max_length=20),
+    db: AsyncSession = Depends(get_db),
+    user=Depends(require_operator),
+):
+    try:
+        return await dataset_service.create_version(db, dataset_id, version, user["email"])
+    except ValueError as exc:
+        raise HTTPException(404 if str(exc) == "Dataset not found" else 409, str(exc)) from exc
+
+
 # ─── Images ───────────────────────────────────────────────────────
 @datasets_router.post("/{dataset_id}/images")
 async def upload_images(
@@ -222,6 +263,7 @@ async def list_images(
     dataset_id: int,
     split: Optional[str] = None,
     annotated: Optional[bool] = None,
+    frame_status: Optional[str] = None,
     limit: int = Query(50, le=500),
     offset: int = 0,
     db: AsyncSession = Depends(get_db),
@@ -232,6 +274,8 @@ async def list_images(
         q = q.where(DatasetImage.split == split)
     if annotated is not None:
         q = q.where(DatasetImage.is_annotated == annotated)
+    if frame_status:
+        q = q.where(DatasetImage.frame_status == frame_status)
     q = q.order_by(DatasetImage.created_at).limit(limit).offset(offset)
     result = await db.execute(q)
     return result.scalars().all()
@@ -254,6 +298,31 @@ async def get_image_file(
     if not img or not os.path.exists(img.file_path):
         raise HTTPException(404)
     return FileResponse(img.file_path)
+
+
+@datasets_router.patch("/{dataset_id}/images/{image_id}/status", response_model=DatasetImageResponse)
+async def update_image_status(
+    dataset_id: int,
+    image_id: int,
+    data: FrameStatusUpdate,
+    db: AsyncSession = Depends(get_db),
+    user=Depends(require_operator),
+):
+    image = await db.get(DatasetImage, image_id)
+    if not image or image.dataset_id != dataset_id:
+        raise HTTPException(404, "Dataset image not found")
+    try:
+        return await lifecycle_service.update_frame_status(
+            db,
+            image_id=image_id,
+            status=data.status.value,
+            review_reason=data.review_reason,
+            review_priority=data.review_priority,
+            scene_tags=data.scene_tags,
+            quality_tags=data.quality_tags,
+        )
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
 
 
 # ─── Videos ───────────────────────────────────────────────────────
@@ -282,16 +351,33 @@ async def extract_frames(
     db: AsyncSession = Depends(get_db),
     user=Depends(require_operator),
 ):
+    dataset = await dataset_service.get_dataset(db, dataset_id)
+    if not dataset:
+        raise HTTPException(404, "Dataset not found")
+    try:
+        dataset_service.require_mutable(dataset)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    video = await db.get(DatasetVideo, video_id)
+    if not video or video.dataset_id != dataset_id:
+        raise HTTPException(404, "Dataset video not found")
+    video.status = "queued"
+    await db.commit()
     from app.celery_app import celery_app
-    task = celery_app.send_task(
-        "app.workers.video_worker.extract_frames_task",
-        kwargs={
-            "dataset_id": dataset_id,
-            "video_id": video_id,
-            "config": config.model_dump(),
-        },
-        queue="cpu",
-    )
+    try:
+        task = celery_app.send_task(
+            "app.workers.video_worker.extract_frames_task",
+            kwargs={
+                "dataset_id": dataset_id,
+                "video_id": video_id,
+                "config": config.model_dump(),
+            },
+            queue="cpu",
+        )
+    except Exception:
+        video.status = "uploaded"
+        await db.commit()
+        raise
     return {"task_id": task.id, "message": "Frame extraction queued"}
 
 
@@ -449,38 +535,50 @@ async def create_job(
     ds = await dataset_service.get_dataset(db, data.dataset_id)
     if not ds:
         raise HTTPException(404, "Dataset not found")
+    training_mode = data.training_mode.value
+    if training_mode != "baseline_inference" and (not ds.is_frozen or not ds.content_hash):
+        raise HTTPException(409, "Freeze the dataset version before starting a reproducible training job")
     model_type = data.model_type.value
     if str(ds.model_type) != model_type:
         raise HTTPException(400, "Dataset model type does not match the training job")
 
     allowed_architectures = {
-        "vehicle_detector": {"yolo11n", "yolo11s", "yolo11m", "yolov8n", "yolov8s"},
-        "plate_detector": {"yolo11n", "yolov8n"},
-        "vehicle_segmenter": {"yolo11n-seg", "yolo11s-seg"},
-        "plate_segmenter": {"yolo11n-seg"},
-        "color_classifier": {"mobilenetv3", "efficientnet", "resnet18"},
-        "ocr": {"lprnet"},
+        key: {item["id"] for item in values}
+        for key, values in ARCHITECTURES.items()
     }
     if data.architecture not in allowed_architectures.get(model_type, set()):
         raise HTTPException(400, f"Unsupported architecture for {model_type}: {data.architecture}")
+    base_model = await resolve_base_model(
+        db,
+        model_type=model_type,
+        architecture=data.architecture,
+        base_model_id=data.base_model_id,
+    )
 
     # Check if split exists
-    result = await db.execute(
-        select(DatasetImage).where(
-            DatasetImage.dataset_id == data.dataset_id,
-            DatasetImage.split.isnot(None),
-        ).limit(1)
-    )
-    if not result.scalar_one_or_none():
-        raise HTTPException(400, "Dataset has no split. Apply train/val/test split first.")
+    if training_mode != "baseline_inference":
+        result = await db.execute(
+            select(DatasetImage).where(
+                DatasetImage.dataset_id == data.dataset_id,
+                DatasetImage.split.isnot(None),
+            ).limit(1)
+        )
+        if not result.scalar_one_or_none():
+            raise HTTPException(400, "Dataset has no split. Apply train/val/test split first.")
+
+    hyperparams = data.hyperparams.model_dump()
+    hyperparams["base_model"] = base_model
 
     job = TrainingJob(
         name=data.name,
         model_type=model_type,
         architecture=data.architecture,
         dataset_id=data.dataset_id,
-        hyperparams=data.hyperparams.model_dump(),
+        training_mode=training_mode,
+        hyperparams=hyperparams,
         augmentation_config=data.augmentation.model_dump(),
+        tile_config=data.tile_config.model_dump(),
+        evaluation_policy=data.evaluation_policy.model_dump(),
         total_epochs=data.hyperparams.epochs,
         status=JobStatus.QUEUED,
         author_email=user["email"],
@@ -664,43 +762,239 @@ gpu_router = APIRouter(prefix="/api/v1/training/gpu", tags=["training-gpu"])
 
 @gpu_router.get("")
 async def gpu_info(user=Depends(get_current_user)):
+    gpus, system = await asyncio.to_thread(
+        lambda: (gpu_service.get_gpu_info(), gpu_service.get_system_stats())
+    )
     return {
-        "gpus": [g.model_dump() for g in gpu_service.get_gpu_info()],
-        "system": gpu_service.get_system_stats(),
+        "gpus": [g.model_dump() for g in gpus],
+        "system": system,
     }
 
 
 # ═══ ARCHITECTURES (for UI dropdown) ════════════════════════════
 arch_router = APIRouter(prefix="/api/v1/training/architectures", tags=["training-arch"])
 
+
+active_learning_router = APIRouter(prefix="/api/v1/training/active-learning", tags=["training-active-learning"])
+
+
+@active_learning_router.get("", response_model=List[ActiveLearningItemResponse])
+async def list_active_learning(
+    dataset_id: Optional[int] = None,
+    status: Optional[str] = None,
+    reason: Optional[str] = None,
+    limit: int = Query(100, le=500),
+    db: AsyncSession = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    return await lifecycle_service.list_active_learning_items(
+        db, dataset_id=dataset_id, status=status, reason=reason, limit=limit
+    )
+
+
+@active_learning_router.post("", response_model=ActiveLearningItemResponse)
+async def create_active_learning_item(
+    data: ActiveLearningCreate,
+    db: AsyncSession = Depends(get_db),
+    user=Depends(require_operator),
+):
+    try:
+        return await lifecycle_service.create_active_learning_item(
+            db,
+            dataset_id=data.dataset_id,
+            image_id=data.image_id,
+            reason=data.reason,
+            priority_score=data.priority_score,
+            suggested_class=data.suggested_class,
+            source=data.source,
+            model_version_id=data.model_version_id,
+            evaluation_error_id=data.evaluation_error_id,
+            details=data.details,
+        )
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@active_learning_router.patch("/{item_id}/status", response_model=ActiveLearningItemResponse)
+async def update_active_learning_status(
+    item_id: int,
+    data: ActiveLearningStatusUpdate,
+    db: AsyncSession = Depends(get_db),
+    user=Depends(require_operator),
+):
+    try:
+        return await lifecycle_service.update_active_learning_status(
+            db, item_id, data.status.value, user["email"]
+        )
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+evaluation_router = APIRouter(prefix="/api/v1/training/evaluation", tags=["training-evaluation"])
+
+
+@evaluation_router.get("/reports", response_model=List[EvaluationReportResponse])
+async def list_evaluation_reports(
+    model_version_id: Optional[int] = None,
+    limit: int = Query(100, le=500),
+    db: AsyncSession = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    return await lifecycle_service.list_evaluation_reports(
+        db, model_version_id=model_version_id, limit=limit
+    )
+
+
+@evaluation_router.get("/reports/{report_id}", response_model=EvaluationReportResponse)
+async def get_evaluation_report(
+    report_id: int,
+    db: AsyncSession = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    report = await db.get(EvaluationReport, report_id)
+    if not report:
+        raise HTTPException(404, "Evaluation report not found")
+    return report
+
+
+@evaluation_router.get("/errors", response_model=List[EvaluationErrorResponse])
+async def list_evaluation_errors(
+    report_id: Optional[int] = None,
+    error_type: Optional[str] = None,
+    limit: int = Query(200, le=1000),
+    db: AsyncSession = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    return await lifecycle_service.list_evaluation_errors(
+        db, report_id=report_id, error_type=error_type, limit=limit
+    )
+
 ARCHITECTURES = {
-    "vehicle_detector": [
-        {"id": "yolo11n", "name": "YOLO11 Nano", "desc": "Fastest, edge devices", "params": "2.6M"},
-        {"id": "yolo11s", "name": "YOLO11 Small", "desc": "Balanced speed/accuracy", "params": "9.4M"},
-        {"id": "yolo11m", "name": "YOLO11 Medium", "desc": "Higher accuracy", "params": "20.1M"},
+    "object_detector": [
+        {"id": "yolo11n", "name": "YOLO11 Nano", "desc": "Fast generic detector baseline", "params": "2.6M"},
+        {"id": "yolo11s", "name": "YOLO11 Small", "desc": "Balanced aerial detector", "params": "9.4M"},
+        {"id": "yolo11m", "name": "YOLO11 Medium", "desc": "Higher-capacity aerial detector", "params": "20.1M"},
         {"id": "yolov8n", "name": "YOLOv8 Nano", "desc": "Stable fallback", "params": "3.2M"},
-        {"id": "yolov8s", "name": "YOLOv8 Small", "desc": "Stable balanced", "params": "11.2M"},
+        {"id": "yolov8s", "name": "YOLOv8 Small", "desc": "Stable balanced fallback", "params": "11.2M"},
     ],
-    "plate_detector": [
-        {"id": "yolo11n", "name": "YOLO11 Nano", "desc": "Recommended for plates", "params": "2.6M"},
-        {"id": "yolov8n", "name": "YOLOv8 Nano", "desc": "Stable plate detector", "params": "3.2M"},
+    "object_segmenter": [
+        {"id": "yolo11n-seg", "name": "YOLO11 Nano Seg", "desc": "Fast generic instance segmentation", "params": "2.9M"},
+        {"id": "yolo11s-seg", "name": "YOLO11 Small Seg", "desc": "Balanced generic mask quality", "params": "10.1M"},
     ],
-    "vehicle_segmenter": [
-        {"id": "yolo11n-seg", "name": "YOLO11 Nano Seg", "desc": "Fast instance segmentation baseline", "params": "2.9M"},
-        {"id": "yolo11s-seg", "name": "YOLO11 Small Seg", "desc": "Balanced mask quality", "params": "10.1M"},
-    ],
-    "plate_segmenter": [
-        {"id": "yolo11n-seg", "name": "YOLO11 Nano Seg", "desc": "Precise plate contours", "params": "2.9M"},
-    ],
-    "color_classifier": [
-        {"id": "mobilenetv3", "name": "MobileNetV3 Small", "desc": "Fast, edge-friendly", "params": "2.5M"},
-        {"id": "efficientnet", "name": "EfficientNet-B0", "desc": "Best accuracy", "params": "5.3M"},
-        {"id": "resnet18", "name": "ResNet-18", "desc": "Classic stable baseline", "params": "11.7M"},
-    ],
-    "ocr": [
-        {"id": "lprnet", "name": "LPRNet", "desc": "Trainable lightweight edge OCR", "params": "1.7M"},
+    "object_classifier": [
+        {"id": "mobilenetv3", "name": "MobileNetV3 Small", "desc": "Fast generic classifier", "params": "2.5M"},
+        {"id": "efficientnet", "name": "EfficientNet-B0", "desc": "Accuracy-oriented classifier", "params": "5.3M"},
+        {"id": "resnet18", "name": "ResNet-18", "desc": "Stable generic baseline", "params": "11.7M"},
     ],
 }
+
+
+async def list_base_models(db: AsyncSession, model_type: str) -> list[dict]:
+    archs = ARCHITECTURES.get(model_type)
+    if not archs:
+        raise HTTPException(404, f"Unknown model type: {model_type}")
+
+    candidates: list[dict] = []
+    result = await db.execute(
+        select(ModelVersion)
+        .where(ModelVersion.model_type == model_type)
+        .order_by(desc(ModelVersion.is_production), desc(ModelVersion.created_at))
+        .limit(50)
+    )
+    for mv in result.scalars().all():
+        if not mv.weights_path:
+            continue
+        path = Path(mv.weights_path)
+        candidates.append({
+            "id": f"registry:{mv.id}",
+            "label": mv.name,
+            "source": "registry",
+            "architecture": mv.architecture,
+            "version": mv.version,
+            "model_version_id": mv.id,
+            "path": mv.weights_path,
+            "available": path.is_file(),
+            "is_production": bool(mv.is_production),
+            "metrics": mv.metrics or {},
+            "training": (mv.artifact_metadata or {}).get("training", {}),
+        })
+
+    type_dir = MODEL_TYPE_DIRS.get(model_type, model_type)
+    inference_dir = Path(settings.INFERENCE_MODELS_PATH) / type_dir
+    for arch in archs:
+        if model_type == "object_classifier":
+            candidates.append({
+                "id": f"torchvision:{arch['id']}",
+                "label": f"{arch['name']} torchvision pretrained",
+                "source": "torchvision",
+                "architecture": arch["id"],
+                "version": "pretrained",
+                "path": None,
+                "available": True,
+                "is_production": False,
+                "metrics": {},
+                "training": {},
+            })
+            continue
+
+        local_path = inference_dir / f"{arch['id']}.pt"
+        if local_path.is_file():
+            candidates.append({
+                "id": f"installed:{arch['id']}",
+                "label": f"{arch['name']} installed weights",
+                "source": "installed",
+                "architecture": arch["id"],
+                "version": "local",
+                "path": str(local_path),
+                "available": True,
+                "is_production": False,
+                "metrics": {},
+                "training": {},
+            })
+        candidates.append({
+            "id": f"ultralytics:{arch['id']}",
+            "label": f"{arch['name']} Ultralytics pretrained",
+            "source": "ultralytics",
+            "architecture": arch["id"],
+            "version": "pretrained",
+            "path": f"{arch['id']}.pt",
+            "available": True,
+            "is_production": False,
+            "metrics": {},
+            "training": {},
+        })
+
+    seen = set()
+    unique = []
+    for item in candidates:
+        if item["id"] in seen:
+            continue
+        seen.add(item["id"])
+        item["label"] = _base_model_display_name(item)
+        unique.append(item)
+    return unique
+
+
+async def resolve_base_model(
+    db: AsyncSession,
+    *,
+    model_type: str,
+    architecture: str,
+    base_model_id: Optional[str],
+) -> dict:
+    candidates = await list_base_models(db, model_type)
+    requested = base_model_id or f"ultralytics:{architecture}"
+    base_model = next((item for item in candidates if item["id"] == requested), None)
+    if base_model is None:
+        raise HTTPException(400, f"Unknown base model for {model_type}: {requested}")
+    if base_model["architecture"] != architecture:
+        raise HTTPException(
+            400,
+            f"Base model {requested} uses {base_model['architecture']}, not {architecture}",
+        )
+    if base_model["source"] == "registry" and not base_model["available"]:
+        raise HTTPException(409, f"Selected registry weights are not available: {base_model['path']}")
+    return base_model
 
 
 @arch_router.get("/{model_type}")
@@ -709,3 +1003,12 @@ async def get_architectures(model_type: str, user=Depends(get_current_user)):
     if not archs:
         raise HTTPException(404, f"Unknown model type: {model_type}")
     return archs
+
+
+@arch_router.get("/{model_type}/base-models")
+async def get_base_models(
+    model_type: str,
+    db: AsyncSession = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    return await list_base_models(db, model_type)

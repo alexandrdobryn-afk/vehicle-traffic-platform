@@ -79,7 +79,7 @@ export default function HealthPage() {
               <div className="bg-card border border-border rounded-xl">
                 <div className="px-5 py-4 border-b border-border">
                   <h3 className="text-sm font-semibold text-foreground flex items-center gap-2">
-                    <Camera className="w-4 h-4" /> {t('Camera Pipelines')}
+                    <Camera className="w-4 h-4" /> {t('Source runtimes')}
                   </h3>
                 </div>
                 <div className="divide-y divide-border">

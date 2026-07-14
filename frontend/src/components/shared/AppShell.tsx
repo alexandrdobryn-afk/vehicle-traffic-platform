@@ -5,7 +5,7 @@ import Sidebar from '@/components/shared/Sidebar'
 import { useAuth } from '@/hooks/useAuth'
 
 export default function AppShell({ children }: { children: React.ReactNode }) {
-  const { isAuthenticated, init } = useAuth()
+  const { isAuthenticated, initialized, init } = useAuth()
   const router = useRouter()
 
   useEffect(() => {
@@ -13,10 +13,10 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   }, [init])
 
   useEffect(() => {
-    if (!isAuthenticated) router.push('/login')
-  }, [isAuthenticated, router])
+    if (initialized && !isAuthenticated) router.push('/login')
+  }, [initialized, isAuthenticated, router])
 
-  if (!isAuthenticated) return null
+  if (!initialized || !isAuthenticated) return null
 
   return (
     <div className="flex min-h-screen bg-background">

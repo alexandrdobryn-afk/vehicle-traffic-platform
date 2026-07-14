@@ -2,27 +2,36 @@
 import { useEffect, useState } from 'react'
 import AppShell from '@/components/shared/AppShell'
 import trainingApi from '@/lib/trainingApi'
-import { TModelVersion, ModelType, MODEL_TYPE_LABELS, DEPLOY_STATUS_COLORS } from '@/types/training'
+import { TEvaluationReport, TModelVersion, ModelType, MODEL_TYPE_LABELS, DEPLOY_STATUS_COLORS } from '@/types/training'
 import { formatDateTime } from '@/lib/utils'
-import { CheckCircle, XCircle, RefreshCw, Upload, RotateCcw, Download, Shield } from 'lucide-react'
+import { CheckCircle, XCircle, RefreshCw, Upload, RotateCcw, Download, Shield, ChevronDown, ChevronRight } from 'lucide-react'
 import toast from 'react-hot-toast'
 import { useTranslation } from '@/lib/i18n'
 
 const TYPE_FILTERS: { value: string; label: string }[] = [
   { value: '', label: 'All Types' },
-  { value: 'vehicle_detector', label: 'Vehicle Detector' },
-  { value: 'plate_detector', label: 'Plate Detector' },
-  { value: 'vehicle_segmenter', label: 'Vehicle Segmenter' },
-  { value: 'plate_segmenter', label: 'Plate Segmenter' },
-  { value: 'ocr', label: 'OCR' },
-  { value: 'color_classifier', label: 'Color Classifier' },
+  { value: 'object_detector', label: 'Object Detector' },
+  { value: 'object_segmenter', label: 'Object Segmenter' },
+  { value: 'object_classifier', label: 'Object Classifier' },
 ]
+
+function metricValue(value: unknown) {
+  if (typeof value === 'number') return value <= 1 ? `${(value * 100).toFixed(1)}%` : value.toFixed(3)
+  if (value == null) return '-'
+  return String(value)
+}
+
+function compactMetricLabel(key: string) {
+  return key.replace(/_/g, ' ')
+}
 
 export default function RegistryPage() {
   const { t, locale } = useTranslation()
   const [models, setModels] = useState<TModelVersion[]>([])
+  const [reports, setReports] = useState<TEvaluationReport[]>([])
   const [filter, setFilter] = useState('')
   const [loading, setLoading] = useState(false)
+  const [expandedId, setExpandedId] = useState<number | null>(null)
   const [approveModal, setApproveModal] = useState<TModelVersion | null>(null)
   const [approveComment, setApproveComment] = useState('')
   const [approving, setApproving] = useState(false)
@@ -30,8 +39,12 @@ export default function RegistryPage() {
   const load = async () => {
     setLoading(true)
     try {
-      const r = await trainingApi.get(`/registry${filter ? `?model_type=${filter}` : ''}`)
-      setModels(r.data)
+      const [modelResponse, reportResponse] = await Promise.all([
+        trainingApi.get(`/registry${filter ? `?model_type=${filter}` : ''}`),
+        trainingApi.get('/evaluation/reports'),
+      ])
+      setModels(modelResponse.data)
+      setReports(reportResponse.data)
     } finally { setLoading(false) }
   }
 
@@ -123,7 +136,14 @@ export default function RegistryPage() {
           </div>
         ) : (
           <div className="space-y-4">
-            {models.map((mv) => (
+            {models.map((mv) => {
+              const report = reports.find(item => item.id === mv.evaluation_report_id)
+                || reports.find(item => item.model_version_id === mv.id)
+              const metadata = mv.artifact_metadata || {}
+              const training = (metadata.training || {}) as Record<string, any>
+              const baseModel = (metadata.base_model || {}) as Record<string, any>
+              const expanded = expandedId === mv.id
+              return (
               <div key={mv.id} className={`bg-card border rounded-xl p-5 ${
                 mv.is_production ? 'border-emerald-500/30' : 'border-border'
               }`}>
@@ -150,7 +170,12 @@ export default function RegistryPage() {
 
                   {/* Actions */}
                   <div className="flex gap-2 shrink-0 flex-wrap justify-end">
-                    {mv.deploy_status === 'pending' && (
+                    <button onClick={() => setExpandedId(expanded ? null : mv.id)}
+                      className="flex items-center gap-1.5 px-3 py-1.5 bg-muted text-muted-foreground rounded-lg text-xs hover:text-foreground">
+                      {expanded ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
+                      {t('Analysis')}
+                    </button>
+                    {(mv.deploy_status === 'pending' || mv.deploy_status === 'candidate') && (
                       <>
                         <button onClick={() => setApproveModal(mv)}
                           className="flex items-center gap-1.5 px-3 py-1.5 bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 rounded-lg text-xs hover:bg-emerald-500/20">
@@ -223,6 +248,27 @@ export default function RegistryPage() {
                   </div>
                 )}
 
+                {mv.gate_result && (
+                  <div className="mt-3 pt-3 border-t border-border/50">
+                    <p className={`text-xs font-medium ${
+                      mv.gate_result === 'approved' ? 'text-emerald-400' :
+                      mv.gate_result === 'rejected' ? 'text-red-400' :
+                      'text-amber-400'
+                    }`}>
+                      {t('Decision gate')}: {t(mv.gate_result)}
+                    </p>
+                    {mv.gate_reasons?.length > 0 && (
+                      <div className="mt-2 flex flex-wrap gap-2">
+                        {mv.gate_reasons.map(reason => (
+                          <span key={reason} className="rounded bg-muted px-2 py-1 text-xs text-muted-foreground">
+                            {t(reason)}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+
                 {/* Auto test results */}
                 {mv.auto_test_results && (
                   <div className="mt-2 flex gap-3 flex-wrap">
@@ -247,6 +293,94 @@ export default function RegistryPage() {
                   </div>
                 )}
 
+                {expanded && (
+                  <div className="mt-4 space-y-4 border-t border-border/50 pt-4">
+                    <div className="grid gap-3 md:grid-cols-3">
+                      <div className="rounded-lg bg-muted/40 p-3">
+                        <p className="mb-2 text-xs font-semibold uppercase text-muted-foreground">{t('Training provenance')}</p>
+                        {[
+                          ['Base model', baseModel.label || baseModel.id || '-'],
+                          ['Base source', baseModel.source || '-'],
+                          ['Mode', training.mode || '-'],
+                          ['Epochs', training.epochs_completed ?? mv.metrics?.epoch ?? '-'],
+                          ['Cumulative epochs', training.cumulative_epochs ?? mv.metrics?.cumulative_epochs ?? '-'],
+                        ].map(([label, value]) => (
+                          <div key={String(label)} className="flex justify-between gap-3 py-1 text-xs">
+                            <span className="text-muted-foreground">{t(String(label))}</span>
+                            <span className="text-right text-foreground">{t(String(value))}</span>
+                          </div>
+                        ))}
+                      </div>
+                      <div className="rounded-lg bg-muted/40 p-3">
+                        <p className="mb-2 text-xs font-semibold uppercase text-muted-foreground">{t('Backbone / Head')}</p>
+                        {[
+                          ['Backbone trainable', training.backbone?.trainable === false ? 'No' : 'Yes'],
+                          ['Frozen layers', training.backbone?.freeze_layers ?? 0],
+                          ['Head trainable', training.head?.trainable === false ? 'No' : 'Yes'],
+                          ['Head architecture', training.head?.architecture || mv.architecture],
+                          ['Metric type', mv.metrics?.metric_type || report?.summary?.metric_type || '-'],
+                        ].map(([label, value]) => (
+                          <div key={String(label)} className="flex justify-between gap-3 py-1 text-xs">
+                            <span className="text-muted-foreground">{t(String(label))}</span>
+                            <span className="text-right text-foreground">{t(String(value))}</span>
+                          </div>
+                        ))}
+                      </div>
+                      <div className="rounded-lg bg-muted/40 p-3">
+                        <p className="mb-2 text-xs font-semibold uppercase text-muted-foreground">{t('Artifacts')}</p>
+                        {[
+                          ['Weights', mv.weights_path ? 'PT saved' : '-'],
+                          ['ONNX', mv.onnx_path ? 'Exported' : '-'],
+                          ['TensorRT', mv.trt_path ? 'Exported' : '-'],
+                          ['Path', mv.weights_path || '-'],
+                        ].map(([label, value]) => (
+                          <div key={String(label)} className="flex justify-between gap-3 py-1 text-xs">
+                            <span className="text-muted-foreground">{t(String(label))}</span>
+                            <span className="max-w-[190px] truncate text-right text-foreground" title={String(value)}>{t(String(value))}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+
+                    {report && (
+                      <div className="grid gap-4 lg:grid-cols-[1fr_1fr]">
+                        <div className="rounded-lg bg-muted/40 p-3">
+                          <p className="mb-3 text-xs font-semibold uppercase text-muted-foreground">{t('Validation metrics')}</p>
+                          <div className="grid grid-cols-2 gap-2">
+                            {Object.entries(report.summary).map(([key, value]) => (
+                              <div key={key} className="rounded bg-background/60 p-2">
+                                <p className="text-[10px] uppercase text-muted-foreground">{t(compactMetricLabel(key))}</p>
+                                <p className="text-sm font-semibold text-foreground">{metricValue(value)}</p>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                        <div className="rounded-lg bg-muted/40 p-3">
+                          <p className="mb-3 text-xs font-semibold uppercase text-muted-foreground">{t('Slice and class analysis')}</p>
+                          <div className="space-y-2">
+                            {Object.entries(report.per_class_metrics || {}).slice(0, 5).map(([name, value]: [string, any]) => (
+                              <div key={name} className="flex justify-between gap-3 text-xs">
+                                <span className="text-foreground">{name}</span>
+                                <span className="text-muted-foreground">
+                                  P {metricValue(value.precision)} / R {metricValue(value.recall)} / F1 {metricValue(value.f1)}
+                                </span>
+                              </div>
+                            ))}
+                            {Object.entries(report.slice_metrics || {}).slice(0, 4).map(([name, value]: [string, any]) => (
+                              <div key={name} className="flex justify-between gap-3 border-t border-border/50 pt-2 text-xs">
+                                <span className="text-foreground">{t(name)}</span>
+                                <span className="text-muted-foreground">
+                                  {t('Recall')} {metricValue(value.recall)} / {t('Samples')} {value.samples ?? 0}
+                                </span>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+
                 {/* Footer */}
                 <div className="flex justify-between items-center mt-3 pt-3 border-t border-border/50">
                   <div className="flex gap-3 text-xs text-muted-foreground">
@@ -259,7 +393,8 @@ export default function RegistryPage() {
                   <span className="text-xs text-muted-foreground">{formatDateTime(mv.created_at, locale)}</span>
                 </div>
               </div>
-            ))}
+              )
+            })}
           </div>
         )}
 
@@ -277,6 +412,17 @@ export default function RegistryPage() {
                     ⚠️ {t('This will replace the current production model and copy weights to the inference backend. Auto tests will run first.')}
                   </p>
                 </div>
+                {approveModal.gate_result && (
+                  <div className={`p-3 rounded-lg border ${
+                    approveModal.gate_result === 'approved'
+                      ? 'bg-emerald-500/10 border-emerald-500/20'
+                      : 'bg-amber-500/10 border-amber-500/20'
+                  }`}>
+                    <p className={`text-sm font-medium ${approveModal.gate_result === 'approved' ? 'text-emerald-400' : 'text-amber-400'}`}>
+                      {t('Decision gate')}: {t(approveModal.gate_result)}
+                    </p>
+                  </div>
+                )}
                 {approveModal.benchmark_vs_prev && !approveModal.benchmark_vs_prev.is_first && (
                   <div className={`p-3 rounded-lg border ${
                     approveModal.benchmark_vs_prev.is_improvement

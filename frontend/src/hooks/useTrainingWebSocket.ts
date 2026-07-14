@@ -13,7 +13,7 @@ export function useTrainingWebSocket(jobId: number | null) {
 
   const connect = useCallback(() => {
     if (!jobId) return
-    const token = localStorage.getItem('vtp_token')
+    const token = localStorage.getItem('bevp_token')
     if (!token) return
 
     const url = `${TRAINING_WS_URL}/ws/training/${jobId}?token=${token}`

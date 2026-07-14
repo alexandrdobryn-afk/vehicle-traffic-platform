@@ -169,7 +169,7 @@ def upgrade() -> None:
         sa.Column('map50_95', sa.Float(), nullable=True),
         sa.Column('accuracy', sa.Float(), nullable=True),
         sa.Column('char_accuracy', sa.Float(), nullable=True),
-        sa.Column('plate_accuracy', sa.Float(), nullable=True),
+        sa.Column('text_accuracy', sa.Float(), nullable=True),
         sa.Column('gpu_memory_mb', sa.Float(), nullable=True),
         sa.Column('gpu_utilization', sa.Float(), nullable=True),
         sa.Column('lr', sa.Float(), nullable=True),

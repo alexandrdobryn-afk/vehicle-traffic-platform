@@ -15,6 +15,12 @@ from celery import Task
 
 from app.celery_app import celery_app
 from app.config import settings
+from app.utils.geometry import (
+    annotation_to_abs_box,
+    clip_box_to_tile,
+    tile_origins,
+    tile_stride,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +48,7 @@ def get_db_session():
     return Session()
 
 
-# ─── Main Training Task ───────────────────────────────────────────
+# в”Ђв”Ђв”Ђ Main Training Task в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 
 @celery_app.task(
     bind=True,
@@ -78,13 +84,12 @@ def run_training(self: Task, job_id: int):
         params = job.hyperparams or {}
         model_type = job.model_type
 
-        # Dispatch to correct trainer
-        if model_type in ("vehicle_detector", "plate_detector", "vehicle_segmenter", "plate_segmenter"):
+        if job.training_mode == "baseline_inference":
+            _run_baseline_inference(job, db, params)
+        elif model_type in ("object_detector", "object_segmenter"):
             _train_yolo(job, db, params)
-        elif model_type == "color_classifier":
-            _train_color_classifier(job, db, params)
-        elif model_type == "ocr":
-            _train_ocr(job, db, params)
+        elif model_type == "object_classifier":
+            _train_object_classifier(job, db, params)
         else:
             raise ValueError(f"Unknown model_type: {model_type}")
 
@@ -108,7 +113,143 @@ def run_training(self: Task, job_id: int):
         db.close()
 
 
-# ─── YOLO Training ────────────────────────────────────────────────
+# в”Ђв”Ђв”Ђ Baseline inference в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+
+def _run_baseline_inference(job, db, params: dict):
+    """Run a ready detector over dataset frames and store reviewable predictions."""
+    from ultralytics import YOLO
+    from app.models.database import Annotation, DatasetImage, JobStatus, TrainingJob
+
+    job_id = job.id
+    confidence_threshold = float(params.get("confidence_threshold", 0.35))
+    model_dir = Path(settings.INFERENCE_MODELS_PATH) / "object_detector"
+    candidates = [
+        model_dir / "production.pt",
+        model_dir / "yolo11s.pt",
+        model_dir / "yolo11n.pt",
+    ]
+    model_path = next((path for path in candidates if path.is_file()), None)
+    if model_path is None:
+        raise FileNotFoundError("No baseline object detector is installed")
+
+    model = YOLO(str(model_path))
+    images = db.query(DatasetImage).filter(DatasetImage.dataset_id == job.dataset_id).all()
+    total = len(images)
+    predictions = 0
+    reviewed = 0
+
+    job_rec = db.query(TrainingJob).filter(TrainingJob.id == job_id).first()
+    job_rec.status = JobStatus.TRAINING
+    job_rec.total_epochs = 1
+    db.commit()
+
+    push_progress(job_id, {
+        "job_id": job_id,
+        "status": "training",
+        "message": f"Running baseline inference over {total} frames...",
+        "progress_pct": 5,
+    })
+
+    for index, image in enumerate(images, start=1):
+        if not os.path.exists(image.file_path):
+            continue
+        db.query(Annotation).filter(
+            Annotation.image_id == image.id,
+            Annotation.is_auto == True,
+            Annotation.is_verified == False,
+        ).delete()
+        results = model(image.file_path, conf=confidence_threshold, verbose=False)
+        image_predictions = 0
+        for result in results:
+            for box in result.boxes:
+                cls_id = int(box.cls[0])
+                cls_name = str(result.names.get(cls_id, "unknown")).lower()
+                cx, cy, w, h = box.xywhn[0].tolist()
+                db.add(Annotation(
+                    image_id=image.id,
+                    annotation_type="bbox",
+                    class_name=cls_name,
+                    class_id=cls_id,
+                    x_center=float(cx),
+                    y_center=float(cy),
+                    bbox_width=float(w),
+                    bbox_height=float(h),
+                    confidence=float(box.conf[0]),
+                    is_auto=True,
+                    is_verified=False,
+                    provenance={
+                        "source": "baseline_inference",
+                        "model_path": str(model_path),
+                        "training_job_id": job_id,
+                    },
+                ))
+                image_predictions += 1
+
+        predictions += image_predictions
+        image.is_annotated = image_predictions > 0
+        image.frame_status = "auto_labeled" if image_predictions > 0 else "needs_review"
+        image.review_reason = "baseline_prediction" if image_predictions > 0 else "baseline_no_detection"
+        image.review_priority = 30.0 if image_predictions > 0 else 50.0
+        reviewed += 1
+
+        if index % 10 == 0 or index == total:
+            progress = 5 + (index / max(total, 1)) * 90
+            job_rec.current_epoch = 1
+            job_rec.progress_pct = progress
+            db.commit()
+            push_progress(job_id, {
+                "job_id": job_id,
+                "status": "training",
+                "progress_pct": round(progress, 1),
+                "latest_metrics": {"predictions": predictions, "frames_processed": reviewed},
+                "message": f"Baseline inference: {index}/{total} frames",
+            })
+
+    _finalize_job(db, job_id, {
+        "mode": "baseline_inference",
+        "frames_processed": reviewed,
+        "predictions": predictions,
+        "confidence_threshold": confidence_threshold,
+    })
+
+
+# в”Ђв”Ђв”Ђ YOLO Training в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+
+def _model_type_dir(model_type: str) -> str:
+    return {
+        "object_detector": "object_detector",
+        "object_segmenter": "object_segmenter",
+        "object_classifier": "object_classifier",
+    }.get(model_type, model_type)
+
+
+def _resolve_yolo_model_path(job, arch: str, pretrained: bool, db) -> str:
+    base_model = (job.hyperparams or {}).get("base_model") or {}
+    source = base_model.get("source")
+    path = base_model.get("path")
+
+    if source == "registry":
+        from app.models.database import ModelVersion
+        model_version_id = base_model.get("model_version_id")
+        mv = db.query(ModelVersion).filter(ModelVersion.id == model_version_id).first()
+        if not mv or not mv.weights_path or not Path(mv.weights_path).is_file():
+            raise FileNotFoundError(f"Selected registry base model is unavailable: {model_version_id}")
+        return mv.weights_path
+
+    if source == "installed" and path:
+        if not Path(path).is_file():
+            raise FileNotFoundError(f"Selected installed base model is unavailable: {path}")
+        return str(path)
+
+    if source == "ultralytics" and path:
+        return str(path)
+
+    if pretrained:
+        model_dir = Path(settings.INFERENCE_MODELS_PATH) / _model_type_dir(job.model_type)
+        local_model = model_dir / f"{arch}.pt"
+        return str(local_model) if local_model.exists() else f"{arch}.pt"
+    return f"{arch}.yaml"
+
 
 def _train_yolo(job, db, params: dict):
     from ultralytics import YOLO
@@ -120,7 +261,17 @@ def _train_yolo(job, db, params: dict):
     arch = job.architecture      # yolo11n, yolo11s, yolov8n, etc.
     epochs = params.get("epochs", 100)
     batch = params.get("batch_size", 16)
+    tile_config = job.tile_config or {}
     img_size = params.get("img_size", 640)
+    use_tiled_export = job.training_mode == "tiled_training" and tile_config.get("enabled", True)
+    if use_tiled_export:
+        img_size = int(tile_config.get("tile_size", img_size))
+    elif job.training_mode == "hard_negative_training":
+        tile_config = {
+            **tile_config,
+            "include_empty_tiles": True,
+            "max_empty_tile_ratio": max(float(tile_config.get("max_empty_tile_ratio", 0.25) or 0.25), 0.75),
+        }
     lr = params.get("learning_rate", 0.01)
     device = params.get("device", "auto")
     pretrained = params.get("pretrained", True)
@@ -135,27 +286,28 @@ def _train_yolo(job, db, params: dict):
         __import__("app.models.database", fromlist=["Dataset"]).Dataset
     ).filter_by(id=job.dataset_id).first()
 
-    export_dir = Path(settings.EXPORTS_PATH) / f"dataset_{job.dataset_id}_yolo"
+    if use_tiled_export:
+        tile_size_name = int(tile_config.get("tile_size", img_size))
+        overlap_name = str(tile_config.get("overlap", 0.2)).replace(".", "p")
+        export_dir = Path(settings.EXPORTS_PATH) / f"dataset_{job.dataset_id}_yolo_tiled_{tile_size_name}_{overlap_name}"
+    elif job.training_mode == "hard_negative_training":
+        export_dir = Path(settings.EXPORTS_PATH) / f"dataset_{job.dataset_id}_yolo_hard_negative"
+    else:
+        export_dir = Path(settings.EXPORTS_PATH) / f"dataset_{job.dataset_id}_yolo"
     data_yaml = str(export_dir / "data.yaml")
 
     if not os.path.exists(data_yaml):
         # Synchronous export
-        _export_dataset_sync(db, job.dataset_id, export_dir, dataset)
-
-    # Prefer the model pack already mounted from the inference backend. This
-    # keeps the first training run reproducible and avoids a network download.
-    if pretrained:
-        model_dir = Path(settings.INFERENCE_MODELS_PATH) / (
-            "plate_detector" if job.model_type in {"plate_detector", "plate_segmenter"} else "vehicle_detector"
+        _export_dataset_sync(
+            db,
+            job.dataset_id,
+            export_dir,
+            dataset,
+            tile_config=tile_config if use_tiled_export else None,
+            training_mode=job.training_mode,
         )
-        local_candidates = [
-            model_dir / f"{arch}.pt",
-            model_dir / f"{arch}_plate.pt",
-        ]
-        local_model = next((path for path in local_candidates if path.exists()), None)
-        model_path = str(local_model) if local_model else f"{arch}.pt"
-    else:
-        model_path = f"{arch}.yaml"
+
+    model_path = _resolve_yolo_model_path(job, arch, pretrained, db)
     logger.info("Loading YOLO model for job %s from %s", job_id, model_path)
     model = YOLO(model_path)
 
@@ -252,7 +404,7 @@ def _train_yolo(job, db, params: dict):
     # Augmentation config
     aug = job.augmentation_config or {}
     augmentation_enabled = aug.get("enabled", True)
-    results = model.train(
+    train_kwargs = dict(
         data=data_yaml,
         epochs=epochs,
         batch=batch,
@@ -279,15 +431,21 @@ def _train_yolo(job, db, params: dict):
         hsv_s=aug.get("saturation", 0.2) if augmentation_enabled else 0.0,
         hsv_v=aug.get("brightness", 0.2) if augmentation_enabled else 0.0,
     )
+    if job.training_mode == "head_finetune":
+        train_kwargs["freeze"] = int(params.get("freeze_backbone_layers", 10))
+    elif job.training_mode == "semi_supervised":
+        train_kwargs["close_mosaic"] = max(1, int(epochs * 0.2))
+
+    results = model.train(**train_kwargs)
 
     # Save best weights to model registry
     best_weights = str(run_dir / "train" / "weights" / "best.pt")
     _register_trained_model(db, job, best_weights, results)
 
 
-# ─── Color Classifier Training ────────────────────────────────────
+# в”Ђв”Ђв”Ђ Color Classifier Training в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 
-def _train_color_classifier(job, db, params: dict):
+def _train_object_classifier(job, db, params: dict):
     import torch
     import torch.nn as nn
     from torchvision import transforms, models
@@ -309,7 +467,7 @@ def _train_color_classifier(job, db, params: dict):
     classes = dataset.classes or []
     n_classes = len(classes)
     if n_classes < 2:
-        raise ValueError("Color classification requires at least two classes")
+        raise ValueError("Classification requires at least two classes")
 
     run_dir = Path(settings.LOGS_PATH) / f"job_{job_id}"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -327,10 +485,20 @@ def _train_color_classifier(job, db, params: dict):
         model = models.efficientnet_b0(pretrained=True)
         model.classifier[1] = nn.Linear(model.classifier[1].in_features, n_classes)
 
+    if job.training_mode == "head_finetune":
+        for param in model.parameters():
+            param.requires_grad = False
+        if arch == "resnet18":
+            for param in model.fc.parameters():
+                param.requires_grad = True
+        else:
+            for param in model.classifier.parameters():
+                param.requires_grad = True
+
     model = model.to(device)
 
     # Dataset
-    class ColorDS(TorchDataset):
+    class ClassificationDS(TorchDataset):
         def __init__(self, records, transform):
             self.records = records
             self.transform = transform
@@ -387,13 +555,17 @@ def _train_color_classifier(job, db, params: dict):
     val_records = labeled_records(val_imgs)
     if not train_records or not val_records:
         raise ValueError(
-            "Color training requires verified classification labels in train and val splits"
+            "Classification training requires verified labels in train and val splits"
         )
 
-    train_loader = DataLoader(ColorDS(train_records, train_tf), batch_size=batch, shuffle=True, num_workers=2)
-    val_loader = DataLoader(ColorDS(val_records, val_tf), batch_size=batch, shuffle=False, num_workers=2)
+    train_loader = DataLoader(ClassificationDS(train_records, train_tf), batch_size=batch, shuffle=True, num_workers=2)
+    val_loader = DataLoader(ClassificationDS(val_records, val_tf), batch_size=batch, shuffle=False, num_workers=2)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(
+        [param for param in model.parameters() if param.requires_grad],
+        lr=lr,
+        weight_decay=1e-4,
+    )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     class_counts = [sum(label == class_name for _, label in train_records) for class_name in classes]
     class_weights = torch.tensor(
@@ -467,259 +639,8 @@ def _train_color_classifier(job, db, params: dict):
 
     # Export ONNX
     _export_to_onnx_classification(model, best_path, run_dir, device, arch)
+    (run_dir / "labels.json").write_text(json.dumps({"classes": classes}, indent=2), encoding="utf-8")
     _register_trained_model(db, job, best_path, {"accuracy": best_acc})
-
-
-# ─── OCR Training ─────────────────────────────────────────────────
-
-def _train_ocr(job, db, params: dict):
-    """Train a supported OCR architecture without simulated success paths."""
-    if job.architecture != "lprnet":
-        raise ValueError(f"Unsupported OCR training architecture: {job.architecture}")
-    _train_lprnet(job, db, params)
-
-
-def _train_lprnet(job, db, params: dict):
-    """Train LPRNet with CTC loss on verified OCR annotations."""
-    import torch
-    import torch.nn as nn
-    from torch.utils.data import DataLoader, Dataset as TorchDataset
-    from PIL import Image
-    from app.models.database import (
-        Annotation,
-        DatasetImage,
-        TrainingJob,
-        JobStatus,
-        TrainingMetrics,
-    )
-
-    job_id = job.id
-    epochs = params.get("epochs", 100)
-    batch_size = params.get("batch_size", 16)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    run_dir = Path(settings.LOGS_PATH) / f"job_{job_id}"
-    run_dir.mkdir(parents=True, exist_ok=True)
-
-    chars_table = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-    char_to_idx = {char: index for index, char in enumerate(chars_table)}
-    blank_idx = len(chars_table)
-    max_len = 12
-
-    class LPRNet(nn.Module):
-        def __init__(self, num_chars: int, sequence_len: int = 12):
-            super().__init__()
-            self.backbone = nn.Sequential(
-                nn.Conv2d(3, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(),
-                nn.MaxPool2d(2, stride=2),
-                nn.Conv2d(64, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(),
-                nn.MaxPool2d(2, stride=2),
-                nn.Conv2d(128, 256, 3, padding=1), nn.BatchNorm2d(256), nn.ReLU(),
-                nn.Conv2d(256, 256, 3, padding=1), nn.BatchNorm2d(256), nn.ReLU(),
-                nn.Conv2d(256, num_chars + 1, 1),
-            )
-            self.pool = nn.AdaptiveAvgPool2d((1, sequence_len))
-
-        def forward(self, x):
-            x = self.backbone(x)
-            x = self.pool(x)
-            x = x.squeeze(2)           # (B, C, T)
-            x = x.permute(2, 0, 1)    # (T, B, C)
-            return x
-
-    cyrillic_map = str.maketrans(
-        {"А": "A", "В": "B", "С": "C", "Е": "E", "Н": "H", "І": "I",
-         "К": "K", "М": "M", "О": "O", "Р": "P", "Т": "T", "Х": "X"}
-    )
-
-    def normalize(text: str) -> str:
-        value = (text or "").upper().translate(cyrillic_map)
-        return "".join(char for char in value if char in char_to_idx)
-
-    def collect_records(split: str):
-        records = []
-        images = db.query(DatasetImage).filter_by(dataset_id=job.dataset_id, split=split).all()
-        for image in images:
-            annotation = (
-                db.query(Annotation)
-                .filter(
-                    Annotation.image_id == image.id,
-                    Annotation.annotation_type == "ocr",
-                    Annotation.is_verified == True,
-                )
-                .first()
-            )
-            text = normalize(annotation.ocr_text if annotation else "")
-            if os.path.exists(image.file_path) and 1 <= len(text) <= max_len:
-                records.append((image.file_path, text))
-        return records
-
-    train_records = collect_records("train")
-    val_records = collect_records("val")
-    if not train_records or not val_records:
-        raise ValueError(
-            "LPRNet requires verified OCR annotations in both train and val splits"
-        )
-
-    class PlateDataset(TorchDataset):
-        def __init__(self, records):
-            self.records = records
-
-        def __len__(self):
-            return len(self.records)
-
-        def __getitem__(self, index):
-            path, text = self.records[index]
-            image = Image.open(path).convert("RGB").resize((128, 32))
-            array = np.asarray(image, dtype=np.float32) / 255.0
-            array = (array - 0.5) / 0.5
-            tensor = torch.from_numpy(array.transpose(2, 0, 1))
-            target = torch.tensor([char_to_idx[c] for c in text], dtype=torch.long)
-            return tensor, target, text
-
-    def collate(batch):
-        images, targets, texts = zip(*batch)
-        lengths = torch.tensor([len(target) for target in targets], dtype=torch.long)
-        return torch.stack(images), torch.cat(targets), lengths, list(texts)
-
-    train_loader = DataLoader(
-        PlateDataset(train_records), batch_size=batch_size, shuffle=True,
-        num_workers=params.get("workers", 2), collate_fn=collate,
-    )
-    val_loader = DataLoader(
-        PlateDataset(val_records), batch_size=batch_size, shuffle=False,
-        num_workers=params.get("workers", 2), collate_fn=collate,
-    )
-
-    model = LPRNet(num_chars=len(chars_table), sequence_len=max_len).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=params.get("learning_rate", 1e-3))
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", patience=5)
-    ctc_loss = nn.CTCLoss(blank=blank_idx, zero_infinity=True)
-
-    best_path = str(run_dir / "lprnet_best.pt")
-
-    def decode(logits):
-        predictions = logits.argmax(dim=2).transpose(0, 1).cpu().tolist()
-        decoded = []
-        for sequence in predictions:
-            previous = -1
-            chars = []
-            for token in sequence:
-                if token != previous and token != blank_idx:
-                    chars.append(chars_table[token])
-                previous = token
-            decoded.append("".join(chars))
-        return decoded
-
-    def edit_distance(left: str, right: str) -> int:
-        row = list(range(len(right) + 1))
-        for i, left_char in enumerate(left, 1):
-            next_row = [i]
-            for j, right_char in enumerate(right, 1):
-                next_row.append(min(next_row[-1] + 1, row[j] + 1, row[j - 1] + (left_char != right_char)))
-            row = next_row
-        return row[-1]
-
-    job_rec = db.query(TrainingJob).filter(TrainingJob.id == job_id).first()
-    job_rec.status = JobStatus.TRAINING
-    job_rec.total_epochs = epochs
-    db.commit()
-
-    best_plate_accuracy = -1.0
-    best_char_accuracy = 0.0
-    epochs_without_improvement = 0
-    patience = params.get("patience", 20)
-
-    for epoch in range(1, epochs + 1):
-        model.train()
-        total_loss = 0.0
-        for images, targets, target_lengths, _ in train_loader:
-            images = images.to(device)
-            targets = targets.to(device)
-            target_lengths = target_lengths.to(device)
-            optimizer.zero_grad()
-            logits = model(images)
-            input_lengths = torch.full(
-                (images.size(0),), logits.size(0), dtype=torch.long, device=device
-            )
-            loss = ctc_loss(logits.log_softmax(2), targets, input_lengths, target_lengths)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-            optimizer.step()
-            total_loss += loss.item()
-
-        model.eval()
-        exact = char_total = char_errors = sample_total = 0
-        with torch.no_grad():
-            for images, _, _, texts in val_loader:
-                predictions = decode(model(images.to(device)))
-                for predicted, expected in zip(predictions, texts):
-                    exact += int(predicted == expected)
-                    char_total += max(len(expected), 1)
-                    char_errors += edit_distance(predicted, expected)
-                    sample_total += 1
-
-        plate_accuracy = exact / sample_total
-        char_accuracy = max(0.0, 1.0 - char_errors / char_total)
-        train_loss = total_loss / len(train_loader)
-        scheduler.step(plate_accuracy)
-
-        if plate_accuracy > best_plate_accuracy:
-            best_plate_accuracy = plate_accuracy
-            best_char_accuracy = char_accuracy
-            torch.save(model.state_dict(), best_path)
-            epochs_without_improvement = 0
-        else:
-            epochs_without_improvement += 1
-
-        gpu_mem, gpu_util = _get_gpu_stats()
-        progress = 5 + (epoch / epochs) * 90
-        db.add(TrainingMetrics(
-            job_id=job_id, epoch=epoch, train_loss=train_loss,
-            char_accuracy=char_accuracy, plate_accuracy=plate_accuracy,
-            gpu_memory_mb=gpu_mem, gpu_utilization=gpu_util,
-            lr=optimizer.param_groups[0]["lr"],
-        ))
-        push_progress(job_id, {
-            "job_id": job_id, "status": "training",
-            "current_epoch": epoch, "total_epochs": epochs,
-            "progress_pct": round(progress, 1),
-            "latest_metrics": {
-                "train_loss": train_loss,
-                "char_accuracy": char_accuracy,
-                "plate_accuracy": plate_accuracy,
-            },
-            "message": f"LPRNet epoch {epoch}/{epochs} — plate accuracy: {plate_accuracy:.4f}",
-            "gpu_utilization": gpu_util, "gpu_memory_mb": gpu_mem,
-        })
-        j = db.query(TrainingJob).filter(TrainingJob.id == job_id).first()
-        j.current_epoch = epoch
-        j.progress_pct = progress
-        j.best_metrics = {
-            "char_accuracy": best_char_accuracy,
-            "plate_accuracy": best_plate_accuracy,
-            "epoch": epoch,
-        }
-        db.commit()
-        if epochs_without_improvement >= patience:
-            break
-
-    model.load_state_dict(torch.load(best_path, map_location=device))
-    model.eval()
-    dummy = torch.randn(1, 3, 32, 128).to(device)
-    onnx_path = str(run_dir / "lprnet.onnx")
-    torch.onnx.export(
-        model, dummy, onnx_path,
-        input_names=["input"], output_names=["output"],
-        dynamic_axes={"input": {0: "batch"}, "output": {1: "batch"}},
-        opset_version=17,
-    )
-    _register_trained_model(
-        db, job, best_path,
-        {"char_accuracy": best_char_accuracy, "plate_accuracy": best_plate_accuracy},
-    )
-
-
-# ─── Auto Annotation Task ─────────────────────────────────────────
 
 @celery_app.task(name="app.workers.training_worker.auto_annotate_task")
 def auto_annotate_task(
@@ -743,14 +664,10 @@ def auto_annotate_task(
             model_path = mv.weights_path if mv else None
         else:
             candidates = {
-                "vehicle_detector": [
-                    Path(settings.INFERENCE_MODELS_PATH) / "vehicle_detector" / "production.pt",
-                    Path(settings.INFERENCE_MODELS_PATH) / "vehicle_detector" / "yolo11s.pt",
-                    Path(settings.INFERENCE_MODELS_PATH) / "vehicle_detector" / "yolo11n.pt",
-                ],
-                "plate_detector": [
-                    Path(settings.INFERENCE_MODELS_PATH) / "plate_detector" / "production.pt",
-                    Path(settings.INFERENCE_MODELS_PATH) / "plate_detector" / "yolov8n_plate.pt",
+                "object_detector": [
+                    Path(settings.INFERENCE_MODELS_PATH) / "object_detector" / "production.pt",
+                    Path(settings.INFERENCE_MODELS_PATH) / "object_detector" / "yolo11s.pt",
+                    Path(settings.INFERENCE_MODELS_PATH) / "object_detector" / "yolo11n.pt",
                 ],
             }.get(model_type, [])
             model_path = next((str(path) for path in candidates if path.is_file()), None)
@@ -770,6 +687,7 @@ def auto_annotate_task(
                 db.query(Annotation).filter(Annotation.image_id == img_id).delete()
 
             results = model(img_rec.file_path, conf=confidence_threshold, verbose=False)
+            image_annotation_count = 0
             for result in results:
                 for box in result.boxes:
                     cls_id = int(box.cls[0])
@@ -789,8 +707,12 @@ def auto_annotate_task(
                     )
                     db.add(ann)
                     annotated += 1
+                    image_annotation_count += 1
 
-            img_rec.is_annotated = True
+            img_rec.is_annotated = image_annotation_count > 0
+            img_rec.frame_status = "auto_labeled" if image_annotation_count > 0 else "unlabeled"
+            img_rec.review_reason = "auto_annotation" if image_annotation_count > 0 else "no_predictions"
+            img_rec.review_priority = 25.0 if image_annotation_count > 0 else 5.0
             db.commit()
 
         logger.info(f"Auto-annotated {annotated} boxes across {len(image_ids)} images")
@@ -799,7 +721,7 @@ def auto_annotate_task(
         db.close()
 
 
-# ─── Helpers ──────────────────────────────────────────────────────
+# в”Ђв”Ђв”Ђ Helpers в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 
 def _get_gpu_stats():
     try:
@@ -848,6 +770,7 @@ def _register_trained_model(db, job, weights_path: str, results):
     onnx_candidates = [
         weights.parent / "lprnet.onnx",
         weights.parent / f"{job.architecture}.onnx",
+        weights.parent.parent / f"{job.architecture}.onnx",
     ]
     onnx_path = next((str(path) for path in onnx_candidates if path.is_file()), None)
 
@@ -869,6 +792,41 @@ def _register_trained_model(db, job, weights_path: str, results):
     existing = db.query(ModelVersion).filter_by(model_type=job.model_type).count()
     version_num = existing + 1
     version_str = f"v{version_num}.0"
+    job_record = db.query(TrainingJob).filter(TrainingJob.id == job_id).first()
+    epochs_completed = int(
+        (job_record.current_epoch if job_record else 0)
+        or (job.hyperparams or {}).get("epochs")
+        or job.total_epochs
+        or 0
+    )
+    artifact_dir = (
+        Path(settings.TRAINED_MODELS_PATH)
+        / job.model_type
+        / f"{job.architecture}_{version_str}_job_{job_id}"
+    )
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    saved_weights = artifact_dir / f"epoch_{epochs_completed}_best{weights.suffix}"
+    shutil.copy2(weights, saved_weights)
+    weights_path = str(saved_weights)
+
+    if onnx_path:
+        source_onnx = Path(onnx_path)
+        saved_onnx = artifact_dir / source_onnx.name
+        shutil.copy2(source_onnx, saved_onnx)
+        onnx_path = str(saved_onnx)
+
+    base_model = (job.hyperparams or {}).get("base_model") or {}
+    parent_epochs = 0
+    parent_model_id = base_model.get("model_version_id")
+    if parent_model_id:
+        parent = db.query(ModelVersion).filter(ModelVersion.id == parent_model_id).first()
+        parent_training = (parent.artifact_metadata or {}).get("training", {}) if parent else {}
+        parent_epochs = int(
+            parent_training.get("cumulative_epochs")
+            or parent_training.get("epochs_completed")
+            or 0
+        )
+    cumulative_epochs = parent_epochs + epochs_completed
 
     # Get metrics
     if isinstance(results, dict):
@@ -886,8 +844,10 @@ def _register_trained_model(db, job, weights_path: str, results):
         except Exception:
             metrics = {}
 
+    metrics = {**metrics, "epoch": epochs_completed, "cumulative_epochs": cumulative_epochs}
+
     mv = ModelVersion(
-        name=f"{job.model_type}_{job.architecture}_{version_str}",
+        name=f"{job.name} - {version_str}",
         model_type=job.model_type,
         architecture=job.architecture,
         version=version_str,
@@ -903,9 +863,29 @@ def _register_trained_model(db, job, weights_path: str, results):
             "source": "training_job",
             "training_job_id": job_id,
             "dataset_id": job.dataset_id,
+            "classes": (job.dataset.classes or []) if job.dataset else [],
+            "base_model": base_model,
+            "training": {
+                "mode": job.training_mode,
+                "epochs_completed": epochs_completed,
+                "parent_epochs": parent_epochs,
+                "cumulative_epochs": cumulative_epochs,
+                "backbone": {
+                    "trainable": job.training_mode != "head_finetune",
+                    "freeze_layers": (job.hyperparams or {}).get("freeze_backbone_layers", 10)
+                    if job.training_mode == "head_finetune"
+                    else 0,
+                },
+                "head": {
+                    "trainable": True,
+                    "architecture": job.architecture,
+                },
+                "tile_config": job.tile_config or {},
+                "evaluation_policy": job.evaluation_policy or {},
+            },
             "license": (
                 "AGPL-3.0-or-Ultralytics-Enterprise"
-                if job.model_type in ("vehicle_detector", "plate_detector", "vehicle_segmenter", "plate_segmenter")
+                if job.model_type in ("object_detector", "object_segmenter")
                 else "project-training-output"
             ),
             "weights": artifact_info(weights_path),
@@ -921,6 +901,17 @@ def _register_trained_model(db, job, weights_path: str, results):
     # Update job
     j = db.query(TrainingJob).filter(TrainingJob.id == job_id).first()
     j.output_model_id = mv.id
+    if (job.evaluation_policy or {}).get("auto_validate_after_training", True):
+        try:
+            celery_app.send_task(
+                "app.workers.validation_worker.run_validation",
+                kwargs={"model_version_id": mv.id},
+                queue="gpu",
+            )
+            metrics = {**metrics, "validation_queued": True}
+        except Exception as exc:
+            logger.warning("Could not queue validation for model %s: %s", mv.id, exc)
+            metrics = {**metrics, "validation_queued": False, "validation_queue_error": str(exc)}
     _finalize_job(db, job_id, metrics)
 
     logger.info(f"Model registered: {mv.name} (id={mv.id})")
@@ -944,9 +935,10 @@ def _export_to_onnx_classification(model, pt_path: str, run_dir: Path, device, a
     return onnx_path
 
 
-def _export_dataset_sync(db, dataset_id, export_dir, dataset):
+def _export_dataset_sync(db, dataset_id, export_dir, dataset, tile_config: Optional[dict] = None, training_mode: str = "full_finetune"):
     """Synchronous YOLO dataset export for use inside Celery worker."""
     import shutil
+    from PIL import Image
     from app.models.database import DatasetImage, Annotation
 
     for split in ["train", "val", "test"]:
@@ -958,33 +950,104 @@ def _export_dataset_sync(db, dataset_id, export_dir, dataset):
         DatasetImage.split.isnot(None),
     ).all()
 
+    use_tiling = bool(tile_config and tile_config.get("enabled", True) and str(dataset.annotation_type) == "bbox")
+    tile_size = int((tile_config or {}).get("tile_size", 1024))
+    overlap = float((tile_config or {}).get("overlap", 0.2))
+    min_visibility = float((tile_config or {}).get("min_visibility", 0.2))
+    include_empty_tiles = bool((tile_config or {}).get("include_empty_tiles", False))
+    max_empty_tile_ratio = float((tile_config or {}).get("max_empty_tile_ratio", 0.25))
+    manifest = {
+        "dataset_id": dataset_id,
+        "tiled": use_tiling,
+        "tile_config": tile_config or {},
+        "images": 0,
+        "tiles": 0,
+        "labels": 0,
+        "empty_tiles": 0,
+    }
+
     for img in images:
         split = img.split or "train"
-        dest = export_dir / split / "images" / img.filename
-        if os.path.exists(img.file_path):
-            shutil.copy2(img.file_path, dest)
+        if not os.path.exists(img.file_path):
+            continue
 
         annotation_type = "segmentation" if str(dataset.annotation_type) == "segmentation" else "bbox"
         anns = db.query(Annotation).filter(
             Annotation.image_id == img.id,
             Annotation.annotation_type == annotation_type,
+            Annotation.is_verified == True,
         ).all()
-        label_file = export_dir / split / "labels" / (Path(img.filename).stem + ".txt")
-        with open(label_file, "w") as f:
-            for ann in anns:
-                if annotation_type == "segmentation":
-                    polygon = ann.polygon or []
-                    if len(polygon) < 3:
+        if training_mode == "hard_negative_training" and img.frame_status == "hard_negative":
+            anns = []
+        manifest["images"] += 1
+
+        if not use_tiling:
+            dest = export_dir / split / "images" / img.filename
+            shutil.copy2(img.file_path, dest)
+            label_file = export_dir / split / "labels" / (Path(img.filename).stem + ".txt")
+            with open(label_file, "w") as f:
+                for ann in anns:
+                    if annotation_type == "segmentation":
+                        polygon = ann.polygon or []
+                        if len(polygon) < 3:
+                            continue
+                        coordinates = " ".join(
+                            f"{float(point[0]):.6f} {float(point[1]):.6f}" for point in polygon
+                        )
+                        f.write(f"{ann.class_id or 0} {coordinates}\n")
+                        manifest["labels"] += 1
+                    else:
+                        f.write(
+                            f"{ann.class_id or 0} {ann.x_center:.6f} {ann.y_center:.6f} "
+                            f"{ann.bbox_width:.6f} {ann.bbox_height:.6f}\n"
+                        )
+                        manifest["labels"] += 1
+            continue
+
+        with Image.open(img.file_path) as source_image:
+            source_image = source_image.convert("RGB")
+            width, height = source_image.size
+            stride = tile_stride(tile_size, overlap)
+            image_tile_origins = tile_origins(width, height, tile_size, stride)
+            empty_tiles_for_image = 0
+            empty_tile_ratio = max(0.0, min(max_empty_tile_ratio, 1.0))
+            max_empty_tiles_for_image = int(len(image_tile_origins) * empty_tile_ratio)
+            if include_empty_tiles and empty_tile_ratio > 0 and max_empty_tiles_for_image == 0:
+                max_empty_tiles_for_image = 1
+            abs_boxes = [annotation_to_abs_box(ann, width, height) for ann in anns]
+            abs_boxes = [box for box in abs_boxes if box is not None]
+
+            for tile_index, (left, top, right, bottom) in enumerate(image_tile_origins):
+                tile_labels = []
+                for ann, box in abs_boxes:
+                    clipped = clip_box_to_tile(box, (left, top, right, bottom), min_visibility)
+                    if clipped is None:
                         continue
-                    coordinates = " ".join(
-                        f"{float(point[0]):.6f} {float(point[1]):.6f}" for point in polygon
+                    x1, y1, x2, y2 = clipped
+                    tw = right - left
+                    th = bottom - top
+                    cx = ((x1 + x2) / 2 - left) / tw
+                    cy = ((y1 + y2) / 2 - top) / th
+                    bw = (x2 - x1) / tw
+                    bh = (y2 - y1) / th
+                    tile_labels.append(
+                        f"{ann.class_id or 0} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}"
                     )
-                    f.write(f"{ann.class_id or 0} {coordinates}\n")
-                else:
-                    f.write(
-                        f"{ann.class_id or 0} {ann.x_center:.6f} {ann.y_center:.6f} "
-                        f"{ann.bbox_width:.6f} {ann.bbox_height:.6f}\n"
-                    )
+
+                if not tile_labels:
+                    if not include_empty_tiles or empty_tiles_for_image >= max_empty_tiles_for_image:
+                        continue
+                    empty_tiles_for_image += 1
+
+                tile_name = f"{Path(img.filename).stem}_tile_{tile_index:05d}_{left}_{top}.jpg"
+                tile_path = export_dir / split / "images" / tile_name
+                label_file = export_dir / split / "labels" / f"{Path(tile_name).stem}.txt"
+                source_image.crop((left, top, right, bottom)).save(tile_path, quality=95)
+                label_file.write_text("\n".join(tile_labels) + ("\n" if tile_labels else ""), encoding="utf-8")
+                manifest["tiles"] += 1
+                manifest["labels"] += len(tile_labels)
+                if not tile_labels:
+                    manifest["empty_tiles"] += 1
 
     import yaml
     with open(export_dir / "data.yaml", "w") as f:
@@ -996,3 +1059,4 @@ def _export_dataset_sync(db, dataset_id, export_dir, dataset):
             "nc": len(dataset.classes or []),
             "names": dataset.classes or [],
         }, f)
+    (export_dir / "tile_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")

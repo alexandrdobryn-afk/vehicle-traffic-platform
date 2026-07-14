@@ -1,6 +1,6 @@
 import { AIMode } from '@/types'
 
-export type AiModelRole = 'vehicle' | 'tracking' | 'plate' | 'ocr' | 'color' | 'brand'
+export type AiModelRole = 'detection' | 'tracking' | 'prediction' | 'classification' | 'segmentation'
 
 export type RuntimeModel = {
   role: AiModelRole
@@ -16,10 +16,31 @@ export type RuntimeMode = {
   models: RuntimeModel[]
 }
 
+export type ArchitectureFamily = 'CNN / YOLO' | 'Transformer / DETR' | 'Hybrid CNN + Transformer' | 'Algorithm' | 'Optional head'
+
+export type ModelChoiceMeta = {
+  label: string
+  family: ArchitectureFamily
+  short: string
+  detail: string
+  availableByDefault?: boolean
+}
+
+export type ManualPipelineOption = {
+  value: string
+  label: string
+  family: ArchitectureFamily
+  detail: string
+  available: boolean
+}
+
 export type AiModeProfile = {
   id: AIMode
   label: string
   eyebrow: string
+  architecture: ArchitectureFamily
+  detectorChoice: string
+  trackerChoice: string
   summary: string
   bestFor: string
   speed: number
@@ -33,201 +54,290 @@ export type AiModeProfile = {
   warning?: string
 }
 
+export const MODEL_CHOICE_META: Record<string, ModelChoiceMeta> = {
+  object_detector_production: {
+    label: 'Production object detector',
+    family: 'CNN / YOLO',
+    short: 'Approved project model',
+    detail: 'The promoted detector produced by our training loop. When present, it should be the main production choice.',
+  },
+  yolo11n_object: {
+    label: 'YOLO11n object detector',
+    family: 'CNN / YOLO',
+    short: 'Fast CNN detector',
+    detail: 'Small YOLO model for high FPS. Good for quick review and weaker hardware, but can miss very small or difficult objects.',
+  },
+  yolo11s_object: {
+    label: 'YOLO11s object detector',
+    family: 'CNN / YOLO',
+    short: 'Standard CNN detector',
+    detail: 'Balanced YOLO model for general video and camera processing. This is the safest default before project fine-tuning.',
+  },
+  rfdetr_nano_object: {
+    label: 'RF-DETR Nano',
+    family: 'Transformer / DETR',
+    short: 'Light DETR-family detector',
+    detail: 'Transformer detector from the RF-DETR family. It can be more robust on complex scenes, but is heavier than YOLO.',
+  },
+  rfdetr_medium_object: {
+    label: 'RF-DETR Medium',
+    family: 'Transformer / DETR',
+    short: 'Accurate DETR-family detector',
+    detail: 'Heavier RF-DETR model for difficult objects and review runs. Use when accuracy matters more than speed.',
+  },
+  rtdetr_aerial: {
+    label: 'RT-DETR Large',
+    family: 'Transformer / DETR',
+    short: 'RT-DETR detector',
+    detail: 'Real-time DETR model through Ultralytics RTDETR. It is heavier than YOLO and useful as a transformer baseline.',
+  },
+  bytetrack: {
+    label: 'ByteTrack',
+    family: 'Algorithm',
+    short: 'Fast tracker',
+    detail: 'Good default tracker for stable boxes and real-time processing.',
+    availableByDefault: true,
+  },
+  botsort: {
+    label: 'BoT-SORT',
+    family: 'Algorithm',
+    short: 'Robust tracker',
+    detail: 'Heavier tracker for difficult motion and occlusion.',
+    availableByDefault: true,
+  },
+  ocsort: {
+    label: 'OC-SORT',
+    family: 'Algorithm',
+    short: 'Motion-focused tracker',
+    detail: 'Motion-first tracker for smooth object movement and camera motion. No appearance model, so it is lighter than DeepSORT.',
+  },
+  deepsort: {
+    label: 'DeepSORT',
+    family: 'Algorithm',
+    short: 'Appearance-aware tracker',
+    detail: 'Uses crop appearance features in addition to motion. Better around crossings and short occlusions, but heavier.',
+  },
+  strongsort: {
+    label: 'StrongSORT',
+    family: 'Algorithm',
+    short: 'Appearance-aware tracker',
+    detail: 'A stronger DeepSORT-style ReID tracker. Disabled until a compatible ReID runtime is added without breaking the CUDA stack.',
+  },
+}
+
+export const EMPTY_MODEL_OPTION: ManualPipelineOption = {
+  value: '',
+  label: 'Recommended automatically',
+  family: 'Algorithm',
+  detail: 'Use the default component for the selected pipeline mode.',
+  available: true,
+}
+
+export const MANUAL_PIPELINE_OPTIONS = {
+  object_detector: [
+    EMPTY_MODEL_OPTION,
+    'object_detector_production',
+    'yolo11n_object',
+    'yolo11s_object',
+    'rfdetr_nano_object',
+    'rfdetr_medium_object',
+    'rtdetr_aerial',
+  ].map((value) => typeof value === 'string' ? toManualOption(value) : value),
+  tracker: [
+    EMPTY_MODEL_OPTION,
+    'bytetrack',
+    'botsort',
+    'ocsort',
+    'deepsort',
+    'strongsort',
+  ].map((value) => typeof value === 'string' ? toManualOption(value) : value),
+  verifier_detector: [
+    EMPTY_MODEL_OPTION,
+    'rfdetr_nano_object',
+    'rfdetr_medium_object',
+  ].map((value) => typeof value === 'string' ? toManualOption(value) : value),
+}
+
+function toManualOption(value: string): ManualPipelineOption {
+  const meta = MODEL_CHOICE_META[value]
+  return {
+    value,
+    label: meta.label,
+    family: meta.family,
+    detail: meta.detail,
+    available: Boolean(meta.availableByDefault),
+  }
+}
+
+const common = {
+  prediction: 'Kalman trajectory prediction',
+  classification: 'Project object classifier when installed',
+  segmentation: 'Project segmenter when installed',
+}
+
 export const AI_MODE_PROFILES: Record<AIMode, AiModeProfile> = {
   speed: {
     id: 'speed',
-    label: 'Speed',
-    eyebrow: 'Maximum throughput',
-    summary: 'Processes more camera feeds with lightweight model preferences and aggressive frame sampling.',
-    bestFor: 'Edge devices, many cameras, real-time alerts',
+    label: 'CNN Fast',
+    eyebrow: 'YOLO11n',
+    architecture: 'CNN / YOLO',
+    detectorChoice: 'yolo11n_object',
+    trackerChoice: 'bytetrack',
+    summary: 'Fast CNN detector for quick review, several sources and weaker hardware. It keeps tiled inference but samples fewer frames.',
+    bestFor: 'Live preview, many sources, first pass over long videos',
     speed: 5,
     accuracy: 3,
     compute: 2,
     accent: 'from-amber-500/20 via-orange-500/10 to-transparent',
     dot: 'bg-amber-400',
-    framePolicy: 'Default: analyze every 3rd frame; low-quality frames may be skipped.',
-    modelPreferences: {
-      vehicle: 'Production TensorRT/PT → YOLO11n TensorRT/PT',
-      tracking: 'ByteTrack',
-      plate: 'OpenImageModels ONNX plate (384)',
-      ocr: 'LPRNet → EasyOCR fallback',
-      color: 'MobileNetV3 ONNX → HSV/KMeans fallback',
-      brand: 'BrandEye logo detector → conservative multi-frame vote',
-    },
+    framePolicy: 'Uses the lightweight YOLO11n detector and speed-oriented frame sampling.',
+    modelPreferences: { detection: 'YOLO11n object detector', tracking: 'ByteTrack', prediction: common.prediction, classification: common.classification, segmentation: common.segmentation },
     pipeline: [
-      { title: 'Sample frames', detail: 'Reduce redundant inference work' },
-      { title: 'Detect + track', detail: 'Light vehicle detector with ByteTrack' },
-      { title: 'Read plate', detail: 'Plate crop, OCR and UA validation' },
-      { title: 'Vote + emit', detail: 'Multi-frame result and events' },
+      { title: 'Keep source resolution', detail: 'Read the original frame and split it into overlapping tiles.' },
+      { title: 'CNN detection', detail: 'Run YOLO11n on tiles for fast object proposals.' },
+      { title: 'Track objects', detail: 'Use ByteTrack and short Kalman prediction to keep IDs stable.' },
+      { title: 'Store review data', detail: 'Save crops, confidence and trajectories for later training review.' },
     ],
   },
   balanced: {
     id: 'balanced',
-    label: 'Balanced',
-    eyebrow: 'Production default',
-    summary: 'Balances stable recognition with practical throughput and is the safest starting point for most cameras.',
-    bestFor: 'Daily production use, mixed day/night traffic',
+    label: 'Standard',
+    eyebrow: 'Single detector',
+    architecture: 'CNN / YOLO',
+    detectorChoice: 'yolo11s_object',
+    trackerChoice: 'bytetrack',
+    summary: 'Runs one selected detector, then sends its detections to the selected tracker and optional analysis modules.',
+    bestFor: 'Normal video and camera processing with one trusted detector',
     speed: 4,
     accuracy: 4,
     compute: 3,
     accent: 'from-cyan-500/20 via-blue-500/10 to-transparent',
     dot: 'bg-cyan-400',
-    framePolicy: 'Default: analyze every 2nd frame; reject frames that are too poor for reliable recognition.',
-    modelPreferences: {
-      vehicle: 'Production model → YOLO11s → YOLO11n',
-      tracking: 'ByteTrack',
-      plate: 'Production plate model → YOLOv8n plate',
-      ocr: 'Production OCR → EasyOCR → LPRNet',
-      color: 'MobileNetV3 ONNX → HSV/KMeans fallback',
-      brand: 'BrandEye logo detector → conservative multi-frame vote',
-    },
+    framePolicy: 'Uses the selected detector on tiled frames. No second model re-check is run.',
+    modelPreferences: { detection: 'YOLO11s object detector', tracking: 'ByteTrack', prediction: common.prediction, classification: common.classification, segmentation: common.segmentation },
     pipeline: [
-      { title: 'Quality gate', detail: 'Check blur, light and usable detail' },
-      { title: 'Detect + track', detail: 'Stable detector with ByteTrack' },
-      { title: 'Plate + attributes', detail: 'OCR, color and vehicle brand voting' },
-      { title: 'Validate + emit', detail: 'Regex, temporal voting and events' },
+      { title: 'Prepare tiles', detail: 'Preserve small details without shrinking the full aerial frame.' },
+      { title: 'Selected detector', detail: 'Run exactly one detector selected on the left.' },
+      { title: 'Selected tracker', detail: 'Track detections with the selected association algorithm.' },
+      { title: 'Optional modules', detail: 'Run classifier, segmentation, OCR or geo only when enabled.' },
     ],
-  },
-  quality: {
-    id: 'quality',
-    label: 'Quality',
-    eyebrow: 'Maximum detail',
-    summary: 'Prioritizes difficult and distant vehicles, processes every frame by default and accepts higher latency.',
-    bestFor: 'Forensics, difficult angles, low-confidence plates',
-    speed: 2,
-    accuracy: 5,
-    compute: 5,
-    accent: 'from-violet-500/20 via-fuchsia-500/10 to-transparent',
-    dot: 'bg-violet-400',
-    framePolicy: 'Default: analyze every frame and keep difficult frames for the heavier recognition path.',
-    modelPreferences: {
-      vehicle: 'Production model → RF-DETR → YOLO11s',
-      tracking: 'BoT-SORT',
-      plate: 'YOLO11n plate (experimental)',
-      ocr: 'Production OCR → EasyOCR → LPRNet',
-      color: 'MobileNetV3 ONNX → HSV/KMeans fallback',
-      brand: 'BrandEye logo detector → conservative multi-frame vote',
-    },
-    pipeline: [
-      { title: 'Keep all frames', detail: 'Avoid early rejection of difficult scenes' },
-      { title: 'Detailed detection', detail: 'RF-DETR when deployed, otherwise resolved YOLO' },
-      { title: 'Robust tracking', detail: 'BoT-SORT profile for harder motion' },
-      { title: 'Validate + vote', detail: 'Full OCR and multi-frame consensus' },
-    ],
-    warning: 'RF-DETR is optional. The resolved model below is the model actually available now.',
   },
   hybrid: {
     id: 'hybrid',
-    label: 'Hybrid',
-    eyebrow: 'Adaptive escalation',
-    summary: 'Starts with the balanced YOLO path and can escalate uncertain or crowded scenes to a quality re-check.',
-    bestFor: 'Variable traffic where difficult scenes appear occasionally',
+    label: 'Double verification',
+    eyebrow: 'YOLO -> RF-DETR',
+    architecture: 'Hybrid CNN + Transformer',
+    detectorChoice: 'yolo11s_object',
+    trackerChoice: 'bytetrack',
+    summary: 'Runs YOLO first, then uses RF-DETR as a verifier for uncertain or crowded frames before tracking.',
+    bestFor: 'Difficult scenes where YOLO needs a transformer second opinion',
     speed: 3,
     accuracy: 5,
     compute: 4,
     accent: 'from-emerald-500/20 via-cyan-500/10 to-transparent',
     dot: 'bg-emerald-400',
-    framePolicy: 'Default: balanced frame sampling with conditional quality re-checks.',
-    modelPreferences: {
-      vehicle: 'YOLO production path + optional RF-DETR re-check',
-      tracking: 'ByteTrack',
-      plate: 'Production plate model → YOLOv8n plate',
-      ocr: 'Production OCR → EasyOCR → LPRNet',
-      color: 'MobileNetV3 ONNX → HSV/KMeans fallback',
-      brand: 'BrandEye logo detector → conservative multi-frame vote',
-    },
+    framePolicy: 'First detector must be YOLO. The verifier must be RF-DETR Nano or RF-DETR Medium.',
+    modelPreferences: { detection: 'YOLO11s + RF-DETR Medium re-check', tracking: 'ByteTrack', prediction: common.prediction, classification: common.classification, segmentation: common.segmentation },
     pipeline: [
-      { title: 'Fast first pass', detail: 'YOLO detects normal traffic' },
-      { title: 'Assess uncertainty', detail: 'Low confidence or crowded scene trigger' },
-      { title: 'Quality re-check', detail: 'RF-DETR only when deployed and loaded' },
-      { title: 'Merge + vote', detail: 'Tracking, OCR and final consensus' },
+      { title: 'YOLO first pass', detail: 'YOLO finds candidate objects quickly across tiles.' },
+      { title: 'Uncertainty check', detail: 'Crowded or weak detections are selected for a heavier pass.' },
+      { title: 'RF-DETR verifier', detail: 'The selected RF-DETR model validates difficult regions.' },
+      { title: 'Merge + track', detail: 'Merged detections are tracked with short Kalman smoothing.' },
     ],
-    warning: 'Hybrid uses YOLO11s normally and performs scheduled or uncertainty-triggered RF-DETR Medium re-checks.',
+    warning: 'Double verification is restricted to YOLO first pass plus RF-DETR verifier. Other pairings are blocked to keep merge behavior predictable.',
+  },
+  quality: {
+    id: 'quality',
+    label: 'Transformer Accurate',
+    eyebrow: 'RF-DETR',
+    architecture: 'Transformer / DETR',
+    detectorChoice: 'rfdetr_medium_object',
+    trackerChoice: 'botsort',
+    summary: 'Heavy transformer detector for offline review. Hidden from the default selector until explicitly needed.',
+    bestFor: 'Offline accuracy checks and difficult footage',
+    speed: 2,
+    accuracy: 5,
+    compute: 5,
+    accent: 'from-violet-500/20 via-fuchsia-500/10 to-transparent',
+    dot: 'bg-violet-400',
+    framePolicy: 'Runs the heavier detector on dense tiled inference.',
+    modelPreferences: { detection: 'RF-DETR Medium object detector', tracking: 'BoT-SORT', prediction: common.prediction, classification: common.classification, segmentation: common.segmentation },
+    pipeline: [
+      { title: 'Full detail input', detail: 'Keep source resolution and tile aggressively.' },
+      { title: 'Transformer detection', detail: 'Run RF-DETR for more expensive object proposals.' },
+      { title: 'Robust tracking', detail: 'Prefer BoT-SORT for harder motion.' },
+      { title: 'Detailed output', detail: 'Store confidence, trajectories and enabled masks.' },
+    ],
   },
   practical: {
     id: 'practical',
-    label: 'Practical NextGen',
-    eyebrow: 'YOLO26 + PaddleOCR',
-    summary: 'Experimental practical preset for testing YOLO26-style detection with stronger OCR and temporal voting.',
-    bestFor: 'A/B tests on mixed camera footage before production promotion',
+    label: 'Production Model',
+    eyebrow: 'Approved artifact',
+    architecture: 'CNN / YOLO',
+    detectorChoice: 'object_detector_production',
+    trackerChoice: 'ocsort',
+    summary: 'Uses the promoted project model when one exists. Kept for compatibility with saved sources.',
+    bestFor: 'Validated project-specific model runs',
     speed: 4,
     accuracy: 4,
     compute: 4,
     accent: 'from-sky-500/20 via-cyan-500/10 to-transparent',
     dot: 'bg-sky-400',
-    framePolicy: 'Default: balanced sampling with PaddleOCR.',
-    modelPreferences: {
-      vehicle: 'YOLO26n PT (TensorRT only on a compatible NVIDIA host)',
-      tracking: 'TrackTrack',
-      plate: 'YOLOv8n plate',
-      ocr: 'PaddleOCR',
-      color: 'MobileNetV3 ONNX → HSV/KMeans fallback',
-      brand: 'BrandEye logo detector → conservative multi-frame vote',
-    },
+    framePolicy: 'Uses the promoted detector and source-local settings.',
+    modelPreferences: { detection: 'Production object detector', tracking: 'OC-SORT', prediction: common.prediction, classification: common.classification, segmentation: common.segmentation },
     pipeline: [
-      { title: 'Quality gate', detail: 'Keep usable frames and score plate crops' },
-      { title: 'YOLO26 detection', detail: 'Use the installed YOLO26 detector' },
-      { title: 'Track + plate', detail: 'Track vehicles, crop plates and read the best frames' },
-      { title: 'Temporal vote', detail: 'Combine OCR candidates across frames' },
+      { title: 'Load approved model', detail: 'Resolve the promoted detector artifact.' },
+      { title: 'Run tiled detection', detail: 'Use the project detector on aerial tiles.' },
+      { title: 'Track + predict', detail: 'Associate objects and smooth short gaps.' },
+      { title: 'Record provenance', detail: 'Keep model and source settings with the run.' },
     ],
-    warning: 'This mode starts only when its required components initialize successfully; it does not silently turn into Balanced.',
   },
   max_accuracy: {
     id: 'max_accuracy',
     label: 'Maximum Accuracy',
-    eyebrow: 'RF-DETR + PaddleOCR',
-    summary: 'Heavier preset for difficult scenes with RF-DETR Medium, TrackTrack, PaddleOCR and composite confidence scoring.',
-    bestFor: 'Forensic review, low-confidence plates, model comparison runs',
-    speed: 2,
+    eyebrow: 'Legacy alias',
+    architecture: 'Transformer / DETR',
+    detectorChoice: 'rfdetr_medium_object',
+    trackerChoice: 'botsort',
+    summary: 'Compatibility alias for heavy RF-DETR review runs.',
+    bestFor: 'Existing sources that already use this mode',
+    speed: 1,
     accuracy: 5,
     compute: 5,
     accent: 'from-fuchsia-500/20 via-violet-500/10 to-transparent',
     dot: 'bg-fuchsia-400',
-    framePolicy: 'Default: analyze every frame and preserve difficult frames for heavier checks.',
-    modelPreferences: {
-      vehicle: 'RF-DETR Medium → YOLO26s → YOLO11s fallback',
-      tracking: 'TrackTrack',
-      plate: 'YOLO11n plate (experimental)',
-      ocr: 'PaddleOCR',
-      color: 'MobileNetV3 ONNX → HSV/KMeans fallback',
-      brand: 'BrandEye logo detector → conservative multi-frame vote',
-    },
+    framePolicy: 'Analyzes every frame with the heaviest available detector.',
+    modelPreferences: { detection: 'RF-DETR Medium object detector', tracking: 'BoT-SORT', prediction: common.prediction, classification: common.classification, segmentation: common.segmentation },
     pipeline: [
-      { title: 'Keep all frames', detail: 'Avoid early rejection of difficult scenes' },
-      { title: 'Heavy detection', detail: 'RF-DETR Medium' },
-      { title: 'OCR + confidence', detail: 'PaddleOCR, temporal voting and composite confidence' },
-      { title: 'Confidence score', detail: 'Expose the effective pipeline for benchmark comparison' },
+      { title: 'Full detail input', detail: 'Keep all useful spatial detail.' },
+      { title: 'Dense detection', detail: 'Use the heaviest installed detector.' },
+      { title: 'Robust tracking', detail: 'Preserve identity through difficult motion.' },
+      { title: 'Export results', detail: 'Store tracks, confidence and enabled masks.' },
     ],
-    warning: 'Embedding-based Vehicle ReID is not part of this build; short gaps are handled by tracker identity stitching.',
   },
   edge_onnx: {
     id: 'edge_onnx',
-    label: 'ONNX Edge',
-    eyebrow: 'Fast path / TensorRT',
-    summary: 'Fast ONNX preset with YOLO26 detection, ByteTrack and FastPlateOCR.',
-    bestFor: 'Jetson, NVIDIA GPU export tests, high camera counts',
+    label: 'Edge Optimized',
+    eyebrow: 'ONNX/TensorRT',
+    architecture: 'CNN / YOLO',
+    detectorChoice: 'object_detector_production',
+    trackerChoice: 'bytetrack',
+    summary: 'Compatibility mode for optimized artifacts. Hidden until ONNX/TensorRT models are promoted.',
+    bestFor: 'Jetson and optimized NVIDIA edge deployments',
     speed: 5,
     accuracy: 3,
     compute: 2,
     accent: 'from-lime-500/20 via-emerald-500/10 to-transparent',
     dot: 'bg-lime-400',
-    framePolicy: 'Default: speed sampling with TensorRT/ONNX preference when artifacts exist.',
-    modelPreferences: {
-      vehicle: 'YOLO26n TensorRT/PT → YOLO11n fallback',
-      tracking: 'ByteTrack',
-      plate: 'OpenImageModels ONNX plate (384)',
-      ocr: 'FastPlateOCR (FastALPR ONNX OCR)',
-      color: 'MobileNetV3 ONNX → HSV/KMeans fallback',
-      brand: 'BrandEye logo detector → conservative multi-frame vote',
-    },
+    framePolicy: 'Uses speed-oriented sampling and optimized artifacts when installed.',
+    modelPreferences: { detection: 'ONNX/TensorRT object detector', tracking: 'ByteTrack', prediction: common.prediction, classification: common.classification, segmentation: common.segmentation },
     pipeline: [
-      { title: 'Sample frames', detail: 'Favor throughput over per-frame detail' },
-      { title: 'TensorRT/ONNX target', detail: 'Use optimized artifacts only when built for this GPU' },
-      { title: 'ByteTrack', detail: 'Low-overhead tracking' },
-      { title: 'Fast OCR vote', detail: 'FastPlateOCR ONNX plus temporal voting' },
+      { title: 'Prepare tiles', detail: 'Split the frame without global downscaling.' },
+      { title: 'Optimized inference', detail: 'Use installed ONNX or TensorRT artifacts.' },
+      { title: 'Fast tracking', detail: 'Maintain IDs with ByteTrack.' },
+      { title: 'Emit results', detail: 'Stream detections and performance data.' },
     ],
-    warning: 'TensorRT engines are machine-specific. Build them on the target NVIDIA GPU before treating this as a real speed result.',
   },
 }
 
-export const AI_MODE_OPTIONS = Object.values(AI_MODE_PROFILES)
+export const AI_MODE_OPTIONS = ['balanced', 'hybrid'].map((id) => AI_MODE_PROFILES[id as AIMode])

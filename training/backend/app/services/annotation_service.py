@@ -7,11 +7,20 @@ from sqlalchemy import select, delete, update
 from app.models.database import Annotation, DatasetImage, Dataset, ModelVersion
 from app.schemas.schemas import AnnotationCreate, AutoAnnotateConfig
 from app.config import settings
+from app.services.lifecycle_service import lifecycle_service
 
 logger = logging.getLogger(__name__)
 
 
 class AnnotationService:
+
+    async def _ensure_mutable(self, db: AsyncSession, image_id: int) -> None:
+        image = await db.get(DatasetImage, image_id)
+        if not image:
+            raise HTTPException(status_code=404, detail="Dataset image not found")
+        dataset = await db.get(Dataset, image.dataset_id)
+        if dataset and dataset.is_frozen:
+            raise HTTPException(status_code=409, detail="Dataset version is frozen; create a new version before editing annotations")
 
     async def get_image_annotations(
         self, db: AsyncSession, image_id: int
@@ -24,6 +33,7 @@ class AnnotationService:
     async def create_annotation(
         self, db: AsyncSession, image_id: int, data: AnnotationCreate
     ) -> Annotation:
+        await self._ensure_mutable(db, image_id)
         ann = Annotation(
             image_id=image_id,
             annotation_type=data.annotation_type,
@@ -48,7 +58,12 @@ class AnnotationService:
         await db.execute(
             update(DatasetImage)
             .where(DatasetImage.id == image_id)
-            .values(is_annotated=True)
+            .values(
+                is_annotated=True,
+                frame_status="auto_labeled" if data.is_auto else "reviewed",
+                review_reason="auto_annotation" if data.is_auto else "manual_annotation",
+                review_priority=25.0 if data.is_auto and data.is_verified is not True else 0.0,
+            )
         )
         await db.commit()
         await db.refresh(ann)
@@ -57,6 +72,7 @@ class AnnotationService:
     async def create_annotations_bulk(
         self, db: AsyncSession, image_id: int, annotations: List[AnnotationCreate]
     ) -> List[Annotation]:
+        await self._ensure_mutable(db, image_id)
         results = []
         for data in annotations:
             ann = Annotation(
@@ -83,7 +99,12 @@ class AnnotationService:
         await db.execute(
             update(DatasetImage)
             .where(DatasetImage.id == image_id)
-            .values(is_annotated=True)
+            .values(
+                is_annotated=True,
+                frame_status="auto_labeled" if any(item.is_auto for item in annotations) else "reviewed",
+                review_reason="auto_annotation" if any(item.is_auto for item in annotations) else "manual_annotation",
+                review_priority=25.0 if any(item.is_auto for item in annotations) else 0.0,
+            )
         )
         await db.commit()
         return results
@@ -97,9 +118,15 @@ class AnnotationService:
         ann = result.scalar_one_or_none()
         if not ann:
             return None
+        await self._ensure_mutable(db, ann.image_id)
 
         for field, val in data.model_dump(exclude_none=True).items():
             setattr(ann, field, val)
+        image = await db.get(DatasetImage, ann.image_id)
+        if image and not data.is_auto and data.is_verified is not False:
+            image.frame_status = "reviewed"
+            image.review_reason = "manual_review"
+            image.review_priority = 0.0
         await db.commit()
         await db.refresh(ann)
         return ann
@@ -111,11 +138,30 @@ class AnnotationService:
         ann = result.scalar_one_or_none()
         if not ann:
             return False
+        await self._ensure_mutable(db, ann.image_id)
+        image = await db.get(DatasetImage, ann.image_id)
+        if ann.is_auto and image:
+            await lifecycle_service.create_active_learning_item(
+                db,
+                dataset_id=image.dataset_id,
+                image_id=image.id,
+                reason="hard_negative",
+                priority_score=80.0,
+                suggested_class=ann.class_name,
+                source="annotation_rejection",
+                details={
+                    "rejected_annotation_id": ann.id,
+                    "class_name": ann.class_name,
+                    "confidence": ann.confidence,
+                    "bbox": [ann.x_center, ann.y_center, ann.bbox_width, ann.bbox_height],
+                },
+            )
         await db.delete(ann)
         await db.commit()
         return True
 
     async def delete_image_annotations(self, db: AsyncSession, image_id: int) -> int:
+        await self._ensure_mutable(db, image_id)
         result = await db.execute(
             select(Annotation).where(Annotation.image_id == image_id)
         )
@@ -126,7 +172,7 @@ class AnnotationService:
         await db.execute(
             update(DatasetImage)
             .where(DatasetImage.id == image_id)
-            .values(is_annotated=False)
+            .values(is_annotated=False, frame_status="unlabeled", review_reason=None, review_priority=0.0)
         )
         await db.commit()
         return count
@@ -138,6 +184,7 @@ class AnnotationService:
         target_image_id: int,
     ) -> int:
         """Copy all annotations from one image to another."""
+        await self._ensure_mutable(db, target_image_id)
         source_anns = await self.get_image_annotations(db, source_image_id)
         for ann in source_anns:
             new_ann = Annotation(
@@ -160,7 +207,7 @@ class AnnotationService:
             await db.execute(
                 update(DatasetImage)
                 .where(DatasetImage.id == target_image_id)
-                .values(is_annotated=True)
+                .values(is_annotated=True, frame_status="reviewed", review_reason="copied_annotation")
             )
         await db.commit()
         return len(source_anns)
@@ -180,7 +227,9 @@ class AnnotationService:
         dataset = await db.get(Dataset, dataset_id)
         if not dataset:
             raise HTTPException(status_code=404, detail="Dataset not found")
-        if dataset.model_type not in ("vehicle_detector", "plate_detector"):
+        if dataset.is_frozen:
+            raise HTTPException(status_code=409, detail="Dataset version is frozen")
+        if dataset.model_type != "object_detector":
             raise HTTPException(status_code=400, detail="Auto-annotation supports detector datasets only")
 
         if config.model_version_id:

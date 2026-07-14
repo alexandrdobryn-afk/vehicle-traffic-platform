@@ -1,4 +1,4 @@
-FROM python:3.11-bookworm
+﻿FROM python:3.11-bookworm
 
 # System dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -32,6 +32,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
         pip install --no-cache-dir -r requirements-ai-optional.txt; \
     fi
 RUN pip install --no-cache-dir lap==0.5.13 protobuf==4.25.8
+RUN pip install --no-cache-dir --no-deps ocsort==0.0.2
 
 # Copy source
 COPY . .
@@ -39,13 +40,13 @@ RUN python scripts/image_integrity_check.py
 
 # Storage directories
 RUN mkdir -p /app/storage/crops /app/storage/frames /app/models
-ENV YOLO_CONFIG_DIR=/home/vtp/.config/Ultralytics
+ENV YOLO_CONFIG_DIR=/home/bevp/.config/Ultralytics
 
 # Non-root user for security
-RUN useradd -m -u 1000 vtp && \
-    mkdir -p /home/vtp/.paddleocr /home/vtp/.paddlex /home/vtp/.EasyOCR /home/vtp/.cache /home/vtp/.config/Ultralytics && \
-    chown -R vtp:vtp /app /home/vtp
-USER vtp
+RUN useradd -m -u 1000 bevp && \
+    mkdir -p /home/bevp/.paddleocr /home/bevp/.paddlex /home/bevp/.EasyOCR /home/bevp/.cache /home/bevp/.config/Ultralytics && \
+    chown -R bevp:bevp /app /home/bevp
+USER bevp
 
 EXPOSE 8000
 

@@ -33,8 +33,8 @@ export default function GeminiReviewPage() {
   const [checked, setChecked] = useState<number[]>([])
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState<number | null>(null)
-  const [datasetName, setDatasetName] = useState('Gemini vehicle masks')
-  const [targetModelType, setTargetModelType] = useState<'vehicle_segmenter' | 'plate_segmenter'>('vehicle_segmenter')
+  const [datasetName, setDatasetName] = useState('Gemini aerial object masks')
+  const targetModelType = 'object_segmenter'
   const [datasetId, setDatasetId] = useState<number | null>(null)
 
   const load = async () => {
@@ -132,7 +132,7 @@ export default function GeminiReviewPage() {
               <section className="bg-card border border-border rounded-xl p-5 space-y-3">
                 <div className="flex items-center gap-2 font-semibold"><Database className="w-4 h-4" />{t('Create segmentation dataset')}</div>
                 <p className="text-xs text-muted-foreground">{t('Select approved candidates in the queue, then import them. Imported data still requires an explicit split and Training Job.')}</p>
-                <div className="grid md:grid-cols-[180px_1fr_auto] gap-3"><select value={targetModelType} onChange={(e) => { const value=e.target.value as 'vehicle_segmenter' | 'plate_segmenter'; setTargetModelType(value); setDatasetName(value === 'vehicle_segmenter' ? 'Gemini vehicle masks' : 'Gemini plate masks') }} className="bg-background border border-border rounded-lg px-3 py-2 text-sm"><option value="vehicle_segmenter">{t('Vehicle Segmenter')}</option><option value="plate_segmenter">{t('Plate Segmenter')}</option></select><input value={datasetName} onChange={(e) => setDatasetName(e.target.value)} className="bg-background border border-border rounded-lg px-3 py-2 text-sm" /><button onClick={importDataset} disabled={!approvedIds.length || busy === -1} className="btn-primary px-4 py-2 rounded-lg text-sm disabled:opacity-50">{t('Import selected')} ({approvedIds.length})</button></div>
+                <div className="grid md:grid-cols-[180px_1fr_auto] gap-3"><div className="bg-background border border-border rounded-lg px-3 py-2 text-sm">{t('Object Segmenter')}</div><input value={datasetName} onChange={(e) => setDatasetName(e.target.value)} className="bg-background border border-border rounded-lg px-3 py-2 text-sm" /><button onClick={importDataset} disabled={!approvedIds.length || busy === -1} className="btn-primary px-4 py-2 rounded-lg text-sm disabled:opacity-50">{t('Import selected')} ({approvedIds.length})</button></div>
                 <div className="flex flex-wrap gap-2">{items.filter((item) => item.status === 'approved' && item.target_model_type !== 'verification_only').map((item) => <label key={item.id} className="flex items-center gap-2 border border-border rounded-lg px-3 py-2 text-xs"><input type="checkbox" checked={checked.includes(item.id)} onChange={(e) => setChecked((value) => e.target.checked ? [...value, item.id] : value.filter((id) => id !== item.id))} />#{item.id}</label>)}</div>
                 {datasetId && <Link href={`/training/datasets/${datasetId}`} className="text-sm text-primary hover:underline">{t('Open created dataset')} #{datasetId}</Link>}
               </section>

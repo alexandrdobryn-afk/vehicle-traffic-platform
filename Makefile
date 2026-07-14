@@ -1,6 +1,6 @@
 .PHONY: up down build logs shell-backend shell-training migrate models trt clean health
 
-# ── Start ──────────────────────────────────────────────────────────
+# Start
 up:
 	bash scripts/start.sh --foreground
 up-d:
@@ -8,19 +8,19 @@ up-d:
 up-monitor:
 	bash scripts/start.sh --profile monitoring
 
-# ── Build ──────────────────────────────────────────────────────────
+# Build
 build:
-	docker compose build --no-cache
+	bash scripts/start.sh --build
 build-training:
-	docker compose build --no-cache training-api training-worker
+	docker compose -f docker-compose.yml -f docker-compose.gpu.yml build --no-cache training-api training-worker
 
-# ── Stop ───────────────────────────────────────────────────────────
+# Stop
 down:
 	docker compose down
 down-v:
 	docker compose down -v
 
-# ── Logs ───────────────────────────────────────────────────────────
+# Logs
 logs:
 	docker compose logs -f
 logs-backend:
@@ -30,7 +30,7 @@ logs-training:
 logs-worker:
 	docker compose logs -f training-worker
 
-# ── Shell ──────────────────────────────────────────────────────────
+# Shell
 shell-backend:
 	docker compose exec backend bash
 shell-frontend:
@@ -40,9 +40,9 @@ shell-training:
 shell-worker:
 	docker compose exec training-worker bash
 shell-db:
-	docker compose exec postgres psql -U vtp_user -d vtp_db
+	docker compose exec postgres psql -U bevp_user -d bevp_db
 
-# ── Database ───────────────────────────────────────────────────────
+# Database
 migrate:
 	docker compose exec backend alembic upgrade head
 migrate-training:
@@ -53,13 +53,13 @@ migrate-create:
 migrate-training-create:
 	docker compose exec training-api alembic revision --autogenerate -m "$(name)"
 
-# ── Models ─────────────────────────────────────────────────────────
+# Models
 models:
-	cd scripts && pip install ultralytics paddleocr cryptography -q && python download_models.py
+	cd scripts && pip install ultralytics cryptography -q && python download_models.py
 trt:
 	cd scripts && python export_tensorrt.py --target all --size n --half
 
-# ── Dev (without docker) ───────────────────────────────────────────
+# Dev without docker
 dev-backend:
 	cd backend && uvicorn app.main:app --reload --port 8000
 dev-training:
@@ -69,28 +69,28 @@ dev-worker:
 dev-frontend:
 	cd frontend && npm run dev
 
-# ── Flower ─────────────────────────────────────────────────────────
+# Flower
 flower:
 	docker compose --profile monitoring up flower -d
-	@echo "Flower UI: http://localhost:5555"
+	@echo "Flower UI: http://localhost:5565/flower"
 
-# ── Cleanup ────────────────────────────────────────────────────────
+# Cleanup
 clean:
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 	find . -name "*.pyc" -delete 2>/dev/null || true
 
-# ── Health ─────────────────────────────────────────────────────────
+# Health
 health:
-	@echo "=== Inference Backend ===" && curl -s http://localhost:8000/api/v1/health | python3 -m json.tool
-	@echo "\n=== Training API ===" && curl -s http://localhost:8001/api/v1/training/health | python3 -m json.tool
+	@echo "=== Inference Backend ===" && curl -s http://localhost:8100/api/v1/health | python3 -m json.tool
+	@echo "\n=== Training API ===" && curl -s http://localhost:8101/api/v1/training/health | python3 -m json.tool
 
-# ── Keys ───────────────────────────────────────────────────────────
+# Keys
 fernet-key:
 	python3 -c "from cryptography.fernet import Fernet; print('FERNET_KEY=' + Fernet.generate_key().decode())"
 secret-key:
 	python3 -c "import secrets; print('SECRET_KEY=' + secrets.token_urlsafe(32))"
 
-# ── Full setup from scratch ────────────────────────────────────────
+# Full setup from scratch
 setup:
 	@echo "Step 1: Generate keys"
 	@python3 -c "from cryptography.fernet import Fernet; import secrets; print('SECRET_KEY=' + secrets.token_urlsafe(32)); print('FERNET_KEY=' + Fernet.generate_key().decode())"

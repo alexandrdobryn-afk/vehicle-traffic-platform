@@ -4,6 +4,8 @@ from datetime import datetime
 from enum import Enum
 from urllib.parse import urlsplit
 
+from app.defaults import default_source_pipeline_config
+
 
 class AIMode(str, Enum):
     SPEED = "speed"
@@ -21,18 +23,27 @@ class CameraSourceType(str, Enum):
     MJPEG = "mjpeg"
     JPEG = "jpeg"
     FILE = "file"
+    USB = "usb"
+    DRONE = "drone"
+
+
+class TaskProfile(str, Enum):
+    GENERIC_OBJECTS = "generic_objects"
+    AERIAL_SMALL_OBJECTS = "aerial_small_objects"
 
 
 def validate_pipeline_config(config: dict[str, Any]) -> dict[str, Any]:
     """Validate source-local recognition settings stored in the JSON column."""
     ranges = {
-        "vehicle_confidence_threshold": (0.1, 0.99),
-        "plate_confidence_threshold": (0.1, 0.99),
-        "ocr_threshold": (0.1, 0.99),
-        "ocr_voting_window": (3, 30),
+        "object_confidence_threshold": (0.05, 0.99),
         "track_missing_grace_frames": (1, 120),
-        "minimum_plate_width": (20, 300),
-        "minimum_plate_height": (10, 150),
+        "min_track_frames_for_event": (1, 120),
+        "min_track_duration_seconds": (0.0, 30.0),
+        "min_box_width": (1, 4096),
+        "min_box_height": (1, 4096),
+        "min_box_area_ratio": (0.0, 1.0),
+        "max_box_area_ratio": (0.0, 1.0),
+        "max_box_aspect_ratio": (1.0, 50.0),
         "frame_skip": (0, 10),
     }
     for key, (minimum, maximum) in ranges.items():
@@ -43,11 +54,148 @@ def validate_pipeline_config(config: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError(f"{key} must be numeric") from exc
             if not minimum <= numeric_value <= maximum:
                 raise ValueError(f"{key} must be between {minimum} and {maximum}")
-    if config.get("plate_regex_profile", "AUTO") not in {"AUTO", "UA", "UK", "IN", "EU", "US"}:
-        raise ValueError("Unsupported plate_regex_profile")
-    if config.get("input_resolution", "1280x720") not in {"640x360", "1280x720", "1920x1080"}:
-        raise ValueError("Unsupported input_resolution")
+    target_classes = config.get("target_classes")
+    if target_classes is not None and (
+        not isinstance(target_classes, list)
+        or any(not isinstance(item, str) or not item.strip() for item in target_classes)
+    ):
+        raise ValueError("target_classes must be a list of non-empty class names")
+    aerial = config.get("aerial") or {}
+    if not isinstance(aerial, dict):
+        raise ValueError("aerial must be an object")
+    if "tile_size" in aerial and not 320 <= int(aerial["tile_size"]) <= 2048:
+        raise ValueError("aerial.tile_size must be between 320 and 2048")
+    if "tile_overlap" in aerial and not 0 <= float(aerial["tile_overlap"]) <= 0.5:
+        raise ValueError("aerial.tile_overlap must be between 0 and 0.5")
+    modules = {
+        "object_memory": {
+            "max_gap_frames": (1, 600),
+            "merge_threshold": (0.0, 1.0),
+            "duplicate_iou": (0.0, 1.0),
+            "duplicate_contained": (0.0, 1.0),
+            "appearance_threshold": (0.0, 1.0),
+        },
+        "kalman_prediction": {"max_prediction_frames": (0, 120)},
+        "classification": {"confidence_threshold": (0.0, 1.0), "interval_frames": (1, 300)},
+        "segmentation": {"confidence_threshold": (0.0, 1.0), "interval_frames": (1, 300)},
+        "ocr": {"confidence_threshold": (0.0, 1.0), "interval_frames": (1, 600)},
+        "reid": {"similarity_threshold": (0.0, 1.0)},
+        "super_resolution": {"min_object_size_px": (4, 512), "max_crops_per_frame": (1, 100)},
+    }
+    for module_name, module_ranges in modules.items():
+        module = config.get(module_name) or {}
+        if not isinstance(module, dict):
+            raise ValueError(f"{module_name} must be an object")
+        if "enabled" in module and not isinstance(module["enabled"], bool):
+            raise ValueError(f"{module_name}.enabled must be boolean")
+        for key, (minimum, maximum) in module_ranges.items():
+            if key in module and not minimum <= float(module[key]) <= maximum:
+                raise ValueError(f"{module_name}.{key} must be between {minimum} and {maximum}")
+    geo = config.get("geo") or {}
+    if not isinstance(geo, dict):
+        raise ValueError("geo must be an object")
+    if "enabled" in geo and not isinstance(geo["enabled"], bool):
+        raise ValueError("geo.enabled must be boolean")
+    if "coordinate_output" in geo and not isinstance(geo["coordinate_output"], bool):
+        raise ValueError("geo.coordinate_output must be boolean")
     return config
+
+
+class ProjectCreate(BaseModel):
+    name: str = Field(..., min_length=2, max_length=255)
+    slug: str = Field(..., pattern=r"^[a-z0-9][a-z0-9-]{1,98}[a-z0-9]$")
+    description: Optional[str] = None
+    task_profile: TaskProfile = TaskProfile.GENERIC_OBJECTS
+    target_classes: List[str] = Field(default_factory=list)
+
+
+class ProjectUpdate(BaseModel):
+    name: Optional[str] = Field(default=None, min_length=2, max_length=255)
+    description: Optional[str] = None
+    task_profile: Optional[TaskProfile] = None
+    target_classes: Optional[List[str]] = None
+    status: Optional[Literal["active", "archived"]] = None
+
+
+class ProjectResponse(BaseModel):
+    id: int
+    name: str
+    slug: str
+    description: Optional[str]
+    task_profile: str
+    target_classes: List[str]
+    status: str
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class PipelineDefinitionCreate(BaseModel):
+    project_id: int
+    name: str = Field(..., min_length=2, max_length=255)
+    description: Optional[str] = None
+    task_profile: TaskProfile = TaskProfile.GENERIC_OBJECTS
+    config: dict[str, Any] = Field(default_factory=dict)
+    is_default: bool = False
+
+    @field_validator("config")
+    @classmethod
+    def validate_config(cls, value):
+        return validate_pipeline_config(value)
+
+
+class PipelineDefinitionResponse(BaseModel):
+    id: int
+    project_id: int
+    name: str
+    description: Optional[str]
+    version: int
+    task_profile: str
+    config: dict[str, Any]
+    is_default: bool
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class EvaluationRunCreate(BaseModel):
+    project_id: Optional[int] = None
+    name: str = Field(..., min_length=2, max_length=255)
+    task_type: Literal[
+        "detection",
+        "tracking",
+        "segmentation",
+        "classification",
+        "pipeline",
+        "replay",
+        "profiling",
+    ]
+    model_name: str = Field(..., min_length=1, max_length=255)
+    dataset_ref: str = Field(..., min_length=1, max_length=500)
+    config: dict[str, Any] = Field(default_factory=dict)
+
+
+class EvaluationRunResponse(BaseModel):
+    id: int
+    project_id: int
+    name: str
+    task_type: str
+    model_name: str
+    dataset_ref: str
+    status: str
+    config: dict[str, Any]
+    metrics: Optional[dict[str, Any]]
+    error_message: Optional[str]
+    started_at: Optional[datetime]
+    finished_at: Optional[datetime]
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
 
 
 def validate_camera_source_url(source_type: CameraSourceType | str, url: str) -> None:
@@ -55,12 +203,17 @@ def validate_camera_source_url(source_type: CameraSourceType | str, url: str) ->
     source_type = CameraSourceType(source_type)
     if source_type == CameraSourceType.FILE:
         raise ValueError("Recorded videos must be added through the video upload endpoint")
+    if source_type == CameraSourceType.USB:
+        if not url.lower().startswith("usb://") or not url[6:].isdigit():
+            raise ValueError("USB sources use usb://<device-index>, for example usb://0")
+        return
     parsed = urlsplit(url.strip())
     allowed_schemes = {
         CameraSourceType.RTSP: {"rtsp", "rtsps"},
         CameraSourceType.HLS: {"http", "https"},
         CameraSourceType.MJPEG: {"http", "https"},
         CameraSourceType.JPEG: {"http", "https"},
+        CameraSourceType.DRONE: {"rtsp", "rtsps", "udp", "http", "https"},
     }
     if parsed.scheme.lower() not in allowed_schemes[source_type]:
         expected = "RTSP/RTSPS" if source_type == CameraSourceType.RTSP else "HTTP/HTTPS"
@@ -78,7 +231,7 @@ class UserRole(str, Enum):
 # Auth
 class LoginRequest(BaseModel):
     # Login identifies an existing account; domain deliverability validation
-    # would incorrectly reject local/offline deployments such as vtp.local.
+    # would incorrectly reject local/offline deployments such as bevp.local.
     email: str = Field(..., min_length=3, max_length=255)
     password: str
 
@@ -109,14 +262,17 @@ class UserResponse(BaseModel):
 
 # Camera
 class CameraCreate(BaseModel):
+    project_id: Optional[int] = None
+    pipeline_id: Optional[int] = None
     name: str = Field(..., min_length=1, max_length=255)
     rtsp_url: str = Field(..., min_length=5)
     source_type: CameraSourceType = CameraSourceType.RTSP
     snapshot_interval_seconds: float = Field(default=1.0, ge=0.25, le=300)
     location: Optional[str] = None
     ai_mode: AIMode = AIMode.BALANCED
+    task_profile: TaskProfile = TaskProfile.AERIAL_SMALL_OBJECTS
     pipeline_mode: Literal["automatic", "manual"] = "automatic"
-    pipeline_config: dict[str, Any] = Field(default_factory=dict)
+    pipeline_config: dict[str, Any] = Field(default_factory=default_source_pipeline_config)
     priority: int = Field(default=1, ge=1, le=10)
     max_fps: int = Field(default=25, ge=1, le=60)
     save_crops: bool = True
@@ -139,12 +295,15 @@ class CameraCreate(BaseModel):
 
 
 class CameraUpdate(BaseModel):
+    project_id: Optional[int] = None
+    pipeline_id: Optional[int] = None
     name: Optional[str] = None
     rtsp_url: Optional[str] = Field(default=None, min_length=5)
     source_type: Optional[CameraSourceType] = None
     snapshot_interval_seconds: Optional[float] = Field(default=None, ge=0.25, le=300)
     location: Optional[str] = None
     ai_mode: Optional[AIMode] = None
+    task_profile: Optional[TaskProfile] = None
     pipeline_mode: Optional[Literal["automatic", "manual"]] = None
     pipeline_config: Optional[dict[str, Any]] = None
     priority: Optional[int] = None
@@ -171,6 +330,8 @@ class CameraUpdate(BaseModel):
 
 class CameraResponse(BaseModel):
     id: int
+    project_id: Optional[int] = None
+    pipeline_id: Optional[int] = None
     name: str
     location: Optional[str]
     status: str
@@ -181,6 +342,7 @@ class CameraResponse(BaseModel):
     progress_percent: Optional[float] = None
     snapshot_interval_seconds: float
     ai_mode: str
+    task_profile: str = "aerial_small_objects"
     pipeline_mode: str = "automatic"
     pipeline_config: Optional[Any] = None
     priority: int
@@ -208,25 +370,25 @@ class BBoxSchema(BaseModel):
     y2: int
 
 
-class TrackResponse(BaseModel):
+class ObjectTrackResponse(BaseModel):
     id: int
-    camera_id: int
+    source_id: int
+    processing_run_id: str
     track_id: int
-    vehicle_class: str
-    final_plate: Optional[str]
-    plate_status: str
-    final_plate_confidence: float
-    color: str
-    color_confidence: float
-    vehicle_make: str
-    make_confidence: float
+    object_class: str
+    confidence: float
+    trajectory: List[List[float]]
+    speed_pixels_per_second: float
+    direction_degrees: Optional[float]
+    state: str
+    attributes: dict[str, Any]
+    best_crop_path: Optional[str]
+    last_bbox: List[int] = Field(default_factory=list)
+    first_video_timestamp_seconds: Optional[float] = None
+    last_video_timestamp_seconds: Optional[float] = None
     first_seen: datetime
     last_seen: datetime
     duration_seconds: float
-    best_vehicle_crop_path: Optional[str]
-    best_plate_crop_path: Optional[str]
-    processing_run_id: str
-    recognition_diagnostics: Optional[Any] = None
 
     class Config:
         from_attributes = True
@@ -235,25 +397,18 @@ class TrackResponse(BaseModel):
 class ActiveTrackSchema(BaseModel):
     track_id: int
     camera_id: int
-    vehicle_class: str
+    object_class: str
     bbox: List[int]
-    color: str
-    color_confidence: float
-    vehicle_make: str
-    make_confidence: float
-    plate: Optional[str]
-    plate_status: str
-    plate_confidence: float
     first_seen: str
     last_seen: str
-    recognition_diagnostics: Optional[Any] = None
+    diagnostics: Optional[Any] = None
 
 
 # Events
 class EventResponse(BaseModel):
     id: int
     camera_id: int
-    vehicle_track_id: Optional[int]
+    object_track_id: Optional[int] = None
     event_type: str
     payload_json: Optional[Any]
     frame_path: Optional[str]
@@ -267,13 +422,12 @@ class EventResponse(BaseModel):
 class WSObjectSchema(BaseModel):
     track_id: int
     bbox: List[int]
-    vehicle_class: str
-    plate: Optional[str]
-    plate_status: str
-    plate_confidence: float
-    color: str
-    color_confidence: float
-    recognition_diagnostics: Optional[Any] = None
+    object_class: Optional[str] = None
+    diagnostics: Optional[Any] = None
+    trajectory: List[List[float]] = Field(default_factory=list)
+    speed_pixels_per_second: float = 0.0
+    direction_degrees: Optional[float] = None
+    state: str = "active"
 
 
 class WSFrameSchema(BaseModel):
@@ -290,43 +444,22 @@ class WSFrameSchema(BaseModel):
     objects: List[WSObjectSchema]
 
 
-# Watchlist
-class WatchlistCreate(BaseModel):
-    plate_number: str = Field(..., min_length=3, max_length=20)
-    description: Optional[str] = None
-    alert_channels: List[str] = ["frontend"]
-
-
-class WatchlistResponse(BaseModel):
-    id: int
-    plate_number: str
-    description: Optional[str]
-    alert_channels: List[str]
-    is_active: bool
-    created_at: datetime
-
-    class Config:
-        from_attributes = True
-
-
 # Analytics
 class AnalyticsSummaryResponse(BaseModel):
-    total_vehicles_today: int
-    total_plates_recognized: int
-    ocr_success_rate: float
+    total_objects_today: int
+    total_events_today: int
     active_cameras: int
     avg_fps: float
     avg_latency_ms: float
-    watchlist_matches_today: int
 
 
-class TrafficVolumePoint(BaseModel):
+class ObjectVolumePoint(BaseModel):
     timestamp: str
     count: int
 
 
-class ColorDistribution(BaseModel):
-    color: str
+class ClassDistribution(BaseModel):
+    object_class: str
     count: int
     percentage: float
 
@@ -337,22 +470,6 @@ class AppSettingsSchema(BaseModel):
     runtime_fallback: Literal["fail_closed", "allow_cpu"] = "fail_closed"
     gpu_device_index: int = Field(default=0, ge=0, le=15)
     inference_precision: Literal["fp32"] = "fp32"
-    tracker_mode: Literal["bytetrack", "botsort", "tracktrack"] = "bytetrack"
-    ocr_engine: Literal["lprnet", "easyocr", "paddleocr", "fastalpr"] = "easyocr"
-    plate_regex_profile: Literal["AUTO", "UA", "UK", "IN", "EU", "US"] = "AUTO"
-    vehicle_confidence_threshold: float = Field(default=0.45, ge=0.1, le=0.99)
-    plate_confidence_threshold: float = Field(default=0.40, ge=0.1, le=0.99)
-    ocr_threshold: float = Field(default=0.60, ge=0.1, le=0.99)
-    frame_skip: int = Field(default=2, ge=1, le=10)
-    input_resolution: Literal["640x360", "1280x720", "1920x1080"] = "1280x720"
-    max_fps_per_camera: int = Field(default=25, ge=1, le=60)
-    recorded_analysis_fps: int = Field(default=5, ge=1, le=30)
-    ocr_voting_window: int = Field(default=10, ge=3, le=30)
-    track_missing_grace_frames: int = Field(default=15, ge=1, le=120)
-    minimum_plate_width: int = Field(default=60, ge=20, le=300)
-    minimum_plate_height: int = Field(default=20, ge=10, le=150)
-    save_crops: bool = True
-    anonymization_mode: bool = False
 
 
 class GeminiSettingsUpdate(BaseModel):
@@ -380,15 +497,3 @@ class GeminiCandidateReview(BaseModel):
             if len(point) != 2 or any(coord < 0 or coord > 1 for coord in point):
                 raise ValueError("Polygon coordinates must be normalized pairs between 0 and 1")
         return value
-
-
-class PlateCandidate(BaseModel):
-    plate_text: str
-    confidence: float
-    regex_valid: bool
-    regex_score: float
-    image_quality_score: float
-    frame_timestamp: datetime
-
-    class Config:
-        from_attributes = True

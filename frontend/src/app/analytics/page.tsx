@@ -1,168 +1,78 @@
 'use client'
-import { useEffect, useState } from 'react'
+
+import { useEffect, useMemo, useState } from 'react'
+import { Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
+
 import AppShell from '@/components/shared/AppShell'
 import api from '@/lib/api'
-import { AnalyticsSummary, TrafficPoint, ColorDist, COLOR_HEX } from '@/types'
-import {
-  AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
-  PieChart, Pie, Cell, Legend,
-} from 'recharts'
-import { format } from 'date-fns'
+import { Camera, ObjectTrack } from '@/types'
 import { useTranslation } from '@/lib/i18n'
 
 export default function AnalyticsPage() {
   const { t } = useTranslation()
-  const [summary, setSummary] = useState<AnalyticsSummary | null>(null)
-  const [traffic, setTraffic] = useState<TrafficPoint[]>([])
-  const [colors, setColors] = useState<ColorDist[]>([])
-  const [perf, setPerf] = useState<any[]>([])
+  const [objects, setObjects] = useState<ObjectTrack[]>([])
+  const [sources, setSources] = useState<Camera[]>([])
+  const [performance, setPerformance] = useState<any[]>([])
   const [hours, setHours] = useState(24)
 
   useEffect(() => {
-    const load = async () => {
-      const [s, t, c, p] = await Promise.all([
-        api.get('/analytics/summary'),
-        api.get(`/analytics/traffic-volume?hours=${hours}`),
-        api.get('/analytics/colors'),
-        api.get('/analytics/performance'),
-      ])
-      setSummary(s.data)
-      setTraffic(t.data)
-      setColors(c.data)
-      setPerf(p.data)
-    }
-    load()
-  }, [hours])
+    Promise.all([api.get('/objects?limit=500'), api.get('/cameras'), api.get('/videos'), api.get('/analytics/performance')])
+      .then(([objectResponse, cameraResponse, videoResponse, performanceResponse]) => {
+        setObjects(objectResponse.data)
+        setSources([...cameraResponse.data, ...videoResponse.data])
+        setPerformance(performanceResponse.data)
+      }).catch(() => {})
+  }, [])
 
-  const formatHour = (ts: string) => {
-    try { return format(new Date(ts), 'HH:mm') } catch { return ts }
-  }
+  const filtered = useMemo(() => {
+    const cutoff = Date.now() - hours * 3600_000
+    return objects.filter((object) => new Date(object.first_seen).getTime() >= cutoff)
+  }, [objects, hours])
+
+  const classCounts = useMemo(() => Object.entries(filtered.reduce<Record<string, number>>((result, object) => {
+    result[object.object_class] = (result[object.object_class] || 0) + 1
+    return result
+  }, {})).sort((a, b) => b[1] - a[1]), [filtered])
+
+  const timeline = useMemo(() => {
+    const buckets = new Map<string, number>()
+    filtered.forEach((object) => {
+      const date = new Date(object.first_seen)
+      date.setMinutes(0, 0, 0)
+      const key = date.toISOString()
+      buckets.set(key, (buckets.get(key) || 0) + 1)
+    })
+    return [...buckets.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([timestamp, count]) => ({ timestamp, count }))
+  }, [filtered])
+
+  const averageConfidence = filtered.length ? Math.round(filtered.reduce((sum, object) => sum + object.confidence, 0) / filtered.length * 100) : 0
+  const averageDuration = filtered.length ? filtered.reduce((sum, object) => sum + object.duration_seconds, 0) / filtered.length : 0
 
   return (
     <AppShell>
-      <div className="p-6 space-y-6">
+      <div className="space-y-6 p-6">
         <div className="flex items-center justify-between pr-40">
-          <div>
-            <h1 className="text-2xl font-bold text-foreground">{t('Analytics')}</h1>
-            <p className="text-muted-foreground text-sm">{t('Traffic insights and AI performance')}</p>
-          </div>
-          <select
-            value={hours}
-            onChange={(e) => setHours(Number(e.target.value))}
-            className="px-3 py-2 bg-background border border-input rounded-lg text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-ring"
-          >
-            {[6, 12, 24, 48, 168].map((h) => (
-              <option key={h} value={h}>{t('Last {value}', { value: h < 24 ? `${h}h` : `${h / 24}d` })}</option>
-            ))}
-          </select>
+          <div><h1 className="text-2xl font-bold">{t('Analytics')}</h1><p className="text-sm text-muted-foreground">{t('Aerial object statistics and inference performance')}</p></div>
+          <select value={hours} onChange={(event) => setHours(Number(event.target.value))} className="rounded-lg border border-input bg-background px-3 py-2 text-sm">{[6, 12, 24, 48, 168].map((value) => <option key={value} value={value}>{t('Last {value}', { value: value < 24 ? `${value}h` : `${value / 24}d` })}</option>)}</select>
         </div>
 
-        {/* Summary KPIs */}
-        {summary && (
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-            {[
-              { label: 'Total Vehicles', value: summary.total_vehicles_today },
-              { label: 'Plates Recognized', value: summary.total_plates_recognized },
-              { label: 'OCR Success', value: `${summary.ocr_success_rate}%` },
-              { label: 'Watchlist Hits', value: summary.watchlist_matches_today },
-            ].map(({ label, value }) => (
-              <div key={label} className="bg-card border border-border rounded-xl p-4">
-                <p className="text-3xl font-bold text-foreground">{value}</p>
-                <p className="text-xs text-muted-foreground mt-1">{t(label)}</p>
-              </div>
-            ))}
-          </div>
-        )}
-
-        {/* Traffic volume chart */}
-        <div className="bg-card border border-border rounded-xl p-6">
-          <h3 className="font-semibold text-foreground mb-4">{t('Traffic Volume')}</h3>
-          {traffic.length > 0 ? (
-            <ResponsiveContainer width="100%" height={220}>
-              <AreaChart data={traffic}>
-                <defs>
-                  <linearGradient id="trafficGrad" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="5%" stopColor="hsl(221 83% 53%)" stopOpacity={0.3} />
-                    <stop offset="95%" stopColor="hsl(221 83% 53%)" stopOpacity={0} />
-                  </linearGradient>
-                </defs>
-                <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" />
-                <XAxis dataKey="timestamp" tickFormatter={formatHour} tick={{ fontSize: 11, fill: 'hsl(var(--muted-foreground))' }} />
-                <YAxis tick={{ fontSize: 11, fill: 'hsl(var(--muted-foreground))' }} />
-                <Tooltip
-                  contentStyle={{ background: 'hsl(var(--card))', border: '1px solid hsl(var(--border))', borderRadius: 8 }}
-                  labelStyle={{ color: 'hsl(var(--foreground))' }}
-                  labelFormatter={formatHour}
-                />
-                <Area type="monotone" dataKey="count" name={t('Vehicles')} stroke="hsl(221 83% 53%)" fill="url(#trafficGrad)" strokeWidth={2} />
-              </AreaChart>
-            </ResponsiveContainer>
-          ) : (
-            <div className="h-56 flex items-center justify-center text-muted-foreground text-sm">{t('No traffic data')}</div>
-          )}
+        <div className="grid grid-cols-2 gap-4 md:grid-cols-4">
+          {[
+            ['Detected objects', filtered.length],
+            ['Object classes', classCounts.length],
+            ['Average confidence', `${averageConfidence}%`],
+            ['Average track duration', `${averageDuration.toFixed(1)} s`],
+          ].map(([label, value]) => <div key={label} className="rounded-xl border border-border bg-card p-4"><p className="text-3xl font-bold">{value}</p><p className="mt-1 text-xs text-muted-foreground">{t(String(label))}</p></div>)}
         </div>
 
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-          {/* Color distribution */}
-          <div className="bg-card border border-border rounded-xl p-6">
-            <h3 className="font-semibold text-foreground mb-4">{t('Color Distribution')}</h3>
-            {colors.length > 0 ? (
-              <div className="flex gap-6">
-                <ResponsiveContainer width="50%" height={180}>
-                  <PieChart>
-                    <Pie data={colors} dataKey="count" nameKey="color" cx="50%" cy="50%" outerRadius={70} innerRadius={40}>
-                      {colors.map((c) => (
-                        <Cell key={c.color} fill={COLOR_HEX[c.color] || '#6b7280'} stroke="hsl(var(--card))" strokeWidth={2} />
-                      ))}
-                    </Pie>
-                    <Tooltip formatter={(value: any, name: any) => [value, t(String(name))]} contentStyle={{ background: 'hsl(var(--card))', border: '1px solid hsl(var(--border))', borderRadius: 8 }} />
-                  </PieChart>
-                </ResponsiveContainer>
-                <div className="flex-1 space-y-1.5 overflow-auto">
-                  {colors.slice(0, 8).map((c) => (
-                    <div key={c.color} className="flex items-center justify-between text-xs">
-                      <div className="flex items-center gap-2">
-                        <span className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: COLOR_HEX[c.color] || '#6b7280' }} />
-                        <span className="text-muted-foreground">{t(c.color)}</span>
-                      </div>
-                      <span className="font-medium text-foreground">{c.percentage}%</span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            ) : (
-              <div className="h-44 flex items-center justify-center text-muted-foreground text-sm">{t('No color data')}</div>
-            )}
-          </div>
+        <section className="rounded-xl border border-border bg-card p-6">
+          <h2 className="mb-4 font-semibold">{t('Objects over time')}</h2>
+          {timeline.length ? <ResponsiveContainer width="100%" height={240}><AreaChart data={timeline}><CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" /><XAxis dataKey="timestamp" tickFormatter={(value) => new Date(value).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} tick={{ fontSize: 11, fill: 'hsl(var(--muted-foreground))' }} /><YAxis tick={{ fontSize: 11, fill: 'hsl(var(--muted-foreground))' }} /><Tooltip labelFormatter={(value) => new Date(value).toLocaleString()} /><Area type="monotone" dataKey="count" name={t('Objects')} stroke="hsl(221 83% 53%)" fill="hsl(221 83% 53% / .2)" /></AreaChart></ResponsiveContainer> : <div className="flex h-60 items-center justify-center text-sm text-muted-foreground">{t('No object data for this period')}</div>}
+        </section>
 
-          {/* Camera performance */}
-          <div className="bg-card border border-border rounded-xl p-6">
-            <h3 className="font-semibold text-foreground mb-4">{t('Camera Performance')}</h3>
-            {perf.length > 0 ? (
-              <div className="space-y-3">
-                {perf.map((cam: any) => (
-                  <div key={cam.camera_id} className="space-y-1">
-                    <div className="flex justify-between text-xs">
-                      <span className="text-muted-foreground">{t('Camera')} #{cam.camera_id}</span>
-                      <span className="font-medium text-foreground">{(cam.fps || 0).toFixed(1)} FPS</span>
-                    </div>
-                    <div className="w-full bg-muted rounded-full h-1.5">
-                      <div
-                        className="bg-primary h-1.5 rounded-full transition-all"
-                        style={{ width: `${Math.min((cam.fps || 0) / 30 * 100, 100)}%` }}
-                      />
-                    </div>
-                    <div className="flex justify-between text-xs text-muted-foreground">
-                      <span>{cam.is_running ? `🟢 ${t('Running')}` : `🔴 ${t('Stopped')}`}</span>
-                      <span>{t('{count} dropped', { count: cam.frames_dropped || 0 })}</span>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            ) : (
-              <div className="h-44 flex items-center justify-center text-muted-foreground text-sm">{t('No cameras running')}</div>
-            )}
-          </div>
+        <div className="grid gap-6 md:grid-cols-2">
+          <section className="rounded-xl border border-border bg-card p-6"><h2 className="mb-4 font-semibold">{t('Objects by class')}</h2>{classCounts.length ? <div className="space-y-3">{classCounts.slice(0, 12).map(([name, count]) => <div key={name}><div className="mb-1 flex justify-between text-xs"><span>{t(name)}</span><span>{count}</span></div><div className="h-2 rounded-full bg-muted"><div className="h-2 rounded-full bg-primary" style={{ width: `${count / classCounts[0][1] * 100}%` }} /></div></div>)}</div> : <p className="py-16 text-center text-sm text-muted-foreground">{t('No classified objects')}</p>}</section>
+          <section className="rounded-xl border border-border bg-card p-6"><h2 className="mb-4 font-semibold">{t('Source performance')}</h2>{performance.length ? <div className="space-y-4">{performance.map((item) => <div key={item.camera_id}><div className="mb-1 flex justify-between text-xs"><span>{sources.find((source) => source.id === item.camera_id)?.name || `${t('Source')} #${item.camera_id}`}</span><span>{(item.fps || 0).toFixed(1)} FPS · {(item.latency_ms || 0).toFixed(0)} ms</span></div><div className="h-2 rounded-full bg-muted"><div className="h-2 rounded-full bg-emerald-500" style={{ width: `${Math.min((item.fps || 0) / 30 * 100, 100)}%` }} /></div></div>)}</div> : <p className="py-16 text-center text-sm text-muted-foreground">{t('No sources running')}</p>}</section>
         </div>
       </div>
     </AppShell>

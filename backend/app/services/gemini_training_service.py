@@ -210,14 +210,12 @@ class GeminiTrainingService:
             x1, y1, x2, y2 = bbox
             local_predictions.append({
                 "track_id": obj.get("track_id"),
-                "class_name": obj.get("vehicle_class"),
+                "class_name": obj.get("object_class"),
                 "confidence": obj.get("detection_confidence"),
                 "box_2d": [
                     round(y1 / analysis_h * 1000), round(x1 / analysis_w * 1000),
                     round(y2 / analysis_h * 1000), round(x2 / analysis_w * 1000),
                 ],
-                "plate": obj.get("plate"),
-                "plate_status": obj.get("plate_status"),
             })
 
         async with self._session_factory() as db:
@@ -269,18 +267,19 @@ class GeminiTrainingService:
             return
         task_instruction = []
         if verify_predictions:
-            task_instruction.append("Verify the supplied local vehicle predictions and report structured disagreements.")
+            task_instruction.append("Verify the supplied local aerial object predictions and report structured disagreements.")
         else:
             task_instruction.append("Do not score the local predictions; set verification confidence to 0 and summarize that verification was disabled.")
         if collect_training:
             task_instruction.append(
-                "Segment every visible vehicle and license plate. Return a tight box_2d using "
+                "Segment every visible target object. Return a tight box_2d using "
                 "[ymin,xmin,ymax,xmax] normalized 0..1000 and a base64 PNG probability mask scoped to that box."
             )
         else:
             task_instruction.append("Training capture is disabled, so return an empty objects array and no masks.")
         prompt = " ".join(task_instruction) + (
-            " Use labels car, truck, bus, motorcycle, van, license_plate. Do not invent occluded pixels. "
+            " Use the local prediction labels when they are plausible, otherwise use concise aerial object labels. "
+            "Do not invent occluded pixels. "
             "Local predictions: " + json.dumps(local_predictions, ensure_ascii=True)
         )
         schema = {
@@ -385,7 +384,7 @@ class GeminiTrainingService:
                 simplified = cv2.approxPolyDP(contour, epsilon, True)
                 polygon = [[round(float(p[0][0]) / width, 6), round(float(p[0][1]) / height, 6)] for p in simplified]
             annotations.append({
-                "class_name": obj.get("label") or "vehicle",
+                "class_name": obj.get("label") or "object",
                 "confidence": float(obj.get("confidence") or 0),
                 "box_2d": [y0, x0, y1, x1],
                 "polygon": polygon,

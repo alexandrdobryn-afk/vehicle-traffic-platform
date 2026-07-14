@@ -7,6 +7,8 @@ import logging
 from pathlib import Path
 from app.celery_app import celery_app
 from app.config import settings
+from app.services.lifecycle_service import lifecycle_service
+from app.utils.geometry import abs_box_to_norm, bbox_iou, norm_box_to_abs
 
 logger = logging.getLogger(__name__)
 
@@ -31,17 +33,19 @@ def run_validation(self, model_version_id: int):
             return {"success": False, "error": "Weights not found"}
 
         # Run validation
-        if model_type in ("vehicle_detector", "plate_detector", "vehicle_segmenter", "plate_segmenter"):
+        if model_type in ("object_detector", "object_segmenter"):
             val_results = _validate_yolo(mv, db)
-        elif model_type == "color_classifier":
+        elif model_type == "object_classifier":
             val_results = _validate_classifier(mv, db)
-        elif model_type == "ocr":
-            val_results = _validate_ocr(mv, db)
         else:
             val_results = {"error": f"Unsupported model type: {model_type}"}
 
         # Auto tests
         auto_tests = _run_auto_tests(mv)
+        smoke_ms = (auto_tests.get("tests") or {}).get("synthetic_smoke_inference_ms")
+        if smoke_ms is not None and "error" not in val_results:
+            val_results["latency_p50_ms"] = smoke_ms
+            val_results["latency_p95_ms"] = smoke_ms
 
         # Benchmark vs production
         benchmark = _benchmark_vs_production(mv, db, val_results)
@@ -49,9 +53,19 @@ def run_validation(self, model_version_id: int):
         mv.auto_test_results = auto_tests
         mv.benchmark_vs_prev = benchmark
         validation_ok = "error" not in val_results and val_results.get("samples", 1) > 0
-        mv.validation_passed = bool(auto_tests.get("passed", False) and validation_ok)
         if validation_ok:
             mv.metrics = val_results
+            lifecycle_service.build_report_for_model(db, mv, val_results, benchmark)
+        else:
+            mv.validation_passed = False
+            mv.gate_result = "rejected"
+            mv.gate_reasons = [val_results.get("error", "validation produced no usable samples")]
+            mv.deploy_status = "rejected"
+        if not auto_tests.get("passed", False):
+            mv.validation_passed = False
+            mv.gate_result = "rejected"
+            mv.gate_reasons = list(mv.gate_reasons or []) + ["required auto tests failed"]
+            mv.deploy_status = "rejected"
         db.commit()
 
         logger.info(f"Validation complete for model {mv.id}: passed={mv.validation_passed}")
@@ -84,23 +98,252 @@ def _validate_yolo(mv, db) -> dict:
         export_dir = Path(settings.EXPORTS_PATH) / f"dataset_{dataset.id}_yolo"
         data_yaml = str(export_dir / "data.yaml")
         if not os.path.exists(data_yaml):
-            return {"error": "Dataset export is missing"}
+            from app.workers.training_worker import _export_dataset_sync
+            _export_dataset_sync(db, dataset.id, export_dir, dataset, training_mode=job.training_mode)
 
         model = YOLO(mv.weights_path)
         results = model.val(data=data_yaml, verbose=False)
         metrics = results.results_dict
+        error_metrics = _collect_yolo_error_metrics(model, job, db)
 
+        metric_suffix = "M" if model_type.endswith("_segmenter") else "B"
         return {
-            "map50": float(metrics.get("metrics/mAP50(B)", 0)),
-            "map50_95": float(metrics.get("metrics/mAP50-95(B)", 0)),
-            "precision": float(metrics.get("metrics/precision(B)", 0)),
-            "recall": float(metrics.get("metrics/recall(B)", 0)),
+            "map50": float(metrics.get(f"metrics/mAP50({metric_suffix})", 0)),
+            "map50_95": float(metrics.get(f"metrics/mAP50-95({metric_suffix})", 0)),
+            "precision": float(metrics.get(f"metrics/precision({metric_suffix})", 0)),
+            "recall": float(metrics.get(f"metrics/recall({metric_suffix})", 0)),
+            "metric_type": "mask" if metric_suffix == "M" else "box",
             "fitness": float(metrics.get("fitness", 0)),
+            **error_metrics,
         }
     except Exception as e:
         logger.warning(f"YOLO validation error: {e}")
         return {"error": str(e)}
 
+
+def _collect_yolo_error_metrics(model, job, db) -> dict:
+    from collections import defaultdict
+    from app.models.database import Annotation, Dataset, DatasetImage
+
+    policy = job.evaluation_policy or {}
+    iou_threshold = float(policy.get("error_iou_threshold", 0.5))
+    conf_threshold = float(policy.get("error_confidence_threshold", 0.25))
+    small_area_threshold = float(policy.get("small_object_area_threshold", 0.01))
+    max_errors = int(policy.get("max_error_items", 300))
+
+    dataset = db.query(Dataset).filter(Dataset.id == job.dataset_id).first()
+    class_names = list(dataset.classes or []) if dataset else []
+    val_imgs = db.query(DatasetImage).filter_by(dataset_id=job.dataset_id, split="val").all()
+    errors = []
+    false_positives = 0
+    false_negatives = 0
+    wrong_class = 0
+    matched_gt = 0
+    gt_total = 0
+    gt_small = 0
+    matched_small = 0
+    pred_total = 0
+    per_class = defaultdict(lambda: {"tp": 0, "fp": 0, "fn": 0, "false_positives": 0, "false_negatives": 0})
+    confusion = defaultdict(lambda: defaultdict(int))
+    slice_totals = defaultdict(lambda: {"samples": 0, "tp": 0, "fp": 0, "fn": 0})
+
+    def class_label(class_id, fallback="unknown"):
+        try:
+            idx = int(class_id)
+        except (TypeError, ValueError):
+            return str(fallback or "unknown")
+        if 0 <= idx < len(class_names):
+            return str(class_names[idx])
+        return str(fallback or f"class_{idx}")
+
+    def image_slices(image):
+        values = []
+        for tag in (image.scene_tags or []):
+            values.append(f"scene:{tag}")
+        for tag in (image.quality_tags or []):
+            values.append(f"quality:{tag}")
+        metadata = image.frame_metadata or {}
+        for key in ("daypart", "weather", "area_type", "altitude_band", "density"):
+            if metadata.get(key):
+                values.append(f"{key}:{metadata[key]}")
+        return values or ["slice:unspecified"]
+
+    for img in val_imgs:
+        if not img.file_path or not os.path.exists(img.file_path):
+            continue
+        width, height = img.width or 0, img.height or 0
+        if width <= 0 or height <= 0:
+            try:
+                from PIL import Image
+                with Image.open(img.file_path) as im:
+                    width, height = im.size
+            except Exception:
+                continue
+
+        gt = []
+        image_tp = image_fp = image_fn = 0
+        annotation_type = "segmentation" if job.model_type.endswith("_segmenter") else "bbox"
+        annotations = db.query(Annotation).filter(
+            Annotation.image_id == img.id,
+            Annotation.annotation_type == annotation_type,
+            Annotation.is_verified == True,
+        ).all()
+        for ann in annotations:
+            box = norm_box_to_abs(
+                ann.x_center, ann.y_center, ann.bbox_width, ann.bbox_height, width, height
+            )
+            if box is None:
+                continue
+            area_ratio = ((box[2] - box[0]) * (box[3] - box[1])) / max(width * height, 1)
+            gt.append({
+                "ann": ann,
+                "box": box,
+                "matched": False,
+                "small": area_ratio <= small_area_threshold,
+                "class_name": class_label(ann.class_id, ann.class_name),
+            })
+            gt_total += 1
+            if area_ratio <= small_area_threshold:
+                gt_small += 1
+
+        predictions = []
+        result_list = model(img.file_path, conf=conf_threshold, verbose=False)
+        for result in result_list:
+            for box in result.boxes:
+                xyxy = [float(v) for v in box.xyxy[0].tolist()]
+                cls_id = int(box.cls[0])
+                predictions.append({
+                    "box": xyxy,
+                    "class_id": cls_id,
+                    "class_name": str(result.names.get(cls_id, "unknown")),
+                    "confidence": float(box.conf[0]),
+                })
+        predictions.sort(key=lambda item: item["confidence"], reverse=True)
+        pred_total += len(predictions)
+
+        for pred in predictions:
+            best = None
+            best_iou = 0.0
+            for item in gt:
+                if item["matched"]:
+                    continue
+                iou = bbox_iou(pred["box"], item["box"])
+                if iou > best_iou:
+                    best_iou = iou
+                    best = item
+
+            if best and best_iou >= iou_threshold:
+                best["matched"] = True
+                expected_name = best["class_name"]
+                if int(best["ann"].class_id or 0) == pred["class_id"]:
+                    matched_gt += 1
+                    image_tp += 1
+                    per_class[expected_name]["tp"] += 1
+                    confusion[expected_name][expected_name] += 1
+                    if best["small"]:
+                        matched_small += 1
+                else:
+                    wrong_class += 1
+                    image_fp += 1
+                    image_fn += 1
+                    per_class[pred["class_name"]]["fp"] += 1
+                    per_class[pred["class_name"]]["false_positives"] += 1
+                    per_class[expected_name]["fn"] += 1
+                    per_class[expected_name]["false_negatives"] += 1
+                    confusion[expected_name][pred["class_name"]] += 1
+                    if len(errors) < max_errors:
+                        errors.append({
+                            "dataset_image_id": img.id,
+                            "error_type": "wrong_class",
+                            "class_name": pred["class_name"],
+                            "confidence": pred["confidence"],
+                            "priority_score": 80.0,
+                            "bbox": abs_box_to_norm(pred["box"], width, height),
+                            "details": {
+                                "expected_class_id": best["ann"].class_id,
+                                "predicted_class_id": pred["class_id"],
+                                "iou": round(best_iou, 4),
+                            },
+                        })
+            else:
+                false_positives += 1
+                image_fp += 1
+                per_class[pred["class_name"]]["fp"] += 1
+                per_class[pred["class_name"]]["false_positives"] += 1
+                confusion["background"][pred["class_name"]] += 1
+                if len(errors) < max_errors:
+                    errors.append({
+                        "dataset_image_id": img.id,
+                        "error_type": "false_positive",
+                        "class_name": pred["class_name"],
+                        "confidence": pred["confidence"],
+                        "priority_score": 60.0 + min(pred["confidence"] * 20, 20),
+                        "bbox": abs_box_to_norm(pred["box"], width, height),
+                        "details": {"best_iou": round(best_iou, 4)},
+                    })
+
+        for item in gt:
+            if item["matched"]:
+                continue
+            false_negatives += 1
+            image_fn += 1
+            per_class[item["class_name"]]["fn"] += 1
+            per_class[item["class_name"]]["false_negatives"] += 1
+            confusion[item["class_name"]]["missed"] += 1
+            priority = 90.0 if item["small"] else 75.0
+            if len(errors) < max_errors:
+                errors.append({
+                    "dataset_image_id": img.id,
+                    "error_type": "small_object_miss" if item["small"] else "false_negative",
+                    "class_name": item["ann"].class_name,
+                    "confidence": None,
+                    "priority_score": priority,
+                    "bbox": abs_box_to_norm(item["box"], width, height),
+                    "details": {
+                        "class_id": item["ann"].class_id,
+                        "small_object": item["small"],
+                    },
+                })
+        for slice_name in image_slices(img):
+            slice_totals[slice_name]["samples"] += 1
+            slice_totals[slice_name]["tp"] += image_tp
+            slice_totals[slice_name]["fp"] += image_fp
+            slice_totals[slice_name]["fn"] += image_fn
+
+    samples = len([img for img in val_imgs if img.file_path and os.path.exists(img.file_path)])
+    recall_small = matched_small / gt_small if gt_small else None
+
+    def scores(values):
+        tp, fp, fn = values["tp"], values["fp"], values["fn"]
+        precision = tp / (tp + fp) if tp + fp else 0.0
+        recall = tp / (tp + fn) if tp + fn else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+        return {
+            **values,
+            "precision": round(precision, 6),
+            "recall": round(recall, 6),
+            "f1": round(f1, 6),
+        }
+
+    per_class_metrics = {name: scores(values) for name, values in sorted(per_class.items())}
+    slice_metrics = {name: scores(values) for name, values in sorted(slice_totals.items())}
+    return {
+        "samples": samples,
+        "false_positives": false_positives,
+        "false_negatives": false_negatives,
+        "wrong_class": wrong_class,
+        "predictions": pred_total,
+        "ground_truth": gt_total,
+        "gt_small": gt_small,
+        "recall_small": recall_small,
+        "ap_small": recall_small,
+        "fp_per_frame": false_positives / samples if samples else None,
+        "fn_per_frame": false_negatives / samples if samples else None,
+        "per_class": per_class_metrics,
+        "slices": slice_metrics,
+        "confusion_matrix": {row: dict(cols) for row, cols in sorted(confusion.items())},
+        "errors": errors,
+    }
 
 def _validate_classifier(mv, db) -> dict:
     try:
@@ -168,91 +411,6 @@ def _validate_classifier(mv, db) -> dict:
         return {"error": str(e)}
 
 
-def _validate_ocr(mv, db) -> dict:
-    """Evaluate exact-plate and normalized character accuracy on the val split."""
-    try:
-        import cv2
-        import numpy as np
-        import onnxruntime as ort
-        from app.models.database import Annotation, DatasetImage, TrainingJob
-
-        if not mv.onnx_path or not os.path.exists(mv.onnx_path):
-            return {"error": "OCR ONNX artifact is missing"}
-        job = db.query(TrainingJob).filter(TrainingJob.id == mv.job_id).first()
-        if not job:
-            return {"error": "Training job not found"}
-
-        chars_table = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-        blank_idx = len(chars_table)
-        cyrillic_to_latin = str.maketrans({
-            "А": "A", "В": "B", "С": "C", "Е": "E", "Н": "H",
-            "І": "I", "К": "K", "М": "M", "О": "O", "Р": "P",
-            "Т": "T", "Х": "X",
-        })
-        session = ort.InferenceSession(mv.onnx_path, providers=["CPUExecutionProvider"])
-        input_name = session.get_inputs()[0].name
-
-        def normalize(text):
-            normalized = (text or "").upper().translate(cyrillic_to_latin)
-            return "".join(char for char in normalized if char in chars_table)
-
-        def decode(output):
-            logits = output[:, 0, :] if output.shape[1] == 1 else output[0]
-            tokens = logits.argmax(axis=1)
-            previous = -1
-            result = []
-            for token in tokens:
-                if token != previous and token != blank_idx:
-                    result.append(chars_table[int(token)])
-                previous = token
-            return "".join(result)
-
-        def edit_distance(left, right):
-            row = list(range(len(right) + 1))
-            for i, left_char in enumerate(left, 1):
-                next_row = [i]
-                for j, right_char in enumerate(right, 1):
-                    next_row.append(min(next_row[-1] + 1, row[j] + 1, row[j - 1] + (left_char != right_char)))
-                row = next_row
-            return row[-1]
-
-        images = db.query(DatasetImage).filter_by(dataset_id=job.dataset_id, split="val").all()
-        exact = samples = char_errors = char_total = 0
-        for image_record in images:
-            annotation = (
-                db.query(Annotation)
-                .filter(
-                    Annotation.image_id == image_record.id,
-                    Annotation.annotation_type == "ocr",
-                    Annotation.is_verified == True,
-                )
-                .first()
-            )
-            expected = normalize(annotation.ocr_text if annotation else "")
-            image = cv2.imread(image_record.file_path)
-            if image is None or not expected:
-                continue
-            image = cv2.resize(image, (128, 32))
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-            image = ((image - 0.5) / 0.5).transpose(2, 0, 1)[None, ...]
-            predicted = decode(session.run(None, {input_name: image})[0])
-            exact += int(predicted == expected)
-            char_errors += edit_distance(predicted, expected)
-            char_total += max(len(expected), 1)
-            samples += 1
-
-        if samples == 0:
-            return {"error": "No verified OCR samples in validation split", "samples": 0}
-        return {
-            "plate_accuracy": round(exact / samples, 4),
-            "char_accuracy": round(max(0.0, 1.0 - char_errors / char_total), 4),
-            "samples": samples,
-        }
-    except Exception as e:
-        logger.warning(f"OCR validation error: {e}")
-        return {"error": str(e)}
-
-
 def _run_auto_tests(mv) -> dict:
     """Size check, speed test, ONNX check."""
     results = {"passed": True, "tests": {}}
@@ -286,7 +444,7 @@ def _run_auto_tests(mv) -> dict:
         results["tests"]["onnx_valid"] = None  # not exported yet
 
     # 4. Speed test (inference time)
-    if mv.model_type in ("vehicle_detector", "plate_detector", "vehicle_segmenter", "plate_segmenter") and weights_ok:
+    if mv.model_type in ("object_detector", "object_segmenter") and weights_ok:
         try:
             import time
             import numpy as np

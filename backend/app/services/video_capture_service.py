@@ -5,7 +5,7 @@ import queue
 import re
 import threading
 import time
-from typing import Optional
+from typing import Optional, Tuple
 
 # Some camera master playlists use valid but uncommon segment extensions
 # (for example .ec3). OpenCV's bundled FFmpeg rejects them unless explicitly
@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 class VideoCaptureService:
     """Capture live sources, poll snapshots, or play a managed video file."""
 
-    STREAM_TYPES = {"rtsp", "hls", "mjpeg"}
+    STREAM_TYPES = {"rtsp", "hls", "mjpeg", "usb", "drone"}
     SUPPORTED_TYPES = STREAM_TYPES | {"jpeg", "file"}
     MAX_SNAPSHOT_BYTES = 20 * 1024 * 1024
 
@@ -96,17 +96,22 @@ class VideoCaptureService:
         logger.info("[Capture cam=%s] Stopped", self.camera_id)
 
     def get_frame(self) -> Optional[np.ndarray]:
+        packet = self.get_frame_packet()
+        return packet[0] if packet is not None else None
+
+    def get_frame_packet(self) -> Optional[Tuple[np.ndarray, dict]]:
+        """Return a frame together with its source position when it is known."""
         if self.source_type == "file":
             try:
                 return self._frame_queue.get_nowait()
             except queue.Empty:
                 return None
-        frame = None
+        packet = None
         try:
             while True:
-                frame = self._frame_queue.get_nowait()
+                packet = self._frame_queue.get_nowait()
         except queue.Empty:
-            return frame
+            return packet
 
     def is_connected(self) -> bool:
         return self._connected
@@ -167,7 +172,8 @@ class VideoCaptureService:
     def _file_loop(self):
         """Decode a finite recording with backpressure and no inference frame loss."""
         try:
-            cap = self._open_capture(self.rtsp_url, timeout=15.0)
+            source = self._capture_source(self.rtsp_url, self.source_type)
+            cap = self._open_capture(source, timeout=15.0)
             if not cap.isOpened():
                 cap.release()
                 raise ValueError("FFmpeg could not open the recorded video")
@@ -206,7 +212,10 @@ class VideoCaptureService:
                 if source_index + 1e-9 < next_emit_frame:
                     continue
                 next_emit_frame += emit_step
-                self._queue_frame(frame)
+                self._queue_frame(frame, {
+                    "source_frame_index": source_index,
+                    "video_timestamp_seconds": round(source_index / source_fps, 3),
+                })
 
         except Exception as exc:
             self.last_error = str(exc)
@@ -224,7 +233,7 @@ class VideoCaptureService:
         with httpx.Client(
             timeout=timeout,
             follow_redirects=True,
-            headers={"Cache-Control": "no-cache", "User-Agent": "VTP/2.0"},
+            headers={"Cache-Control": "no-cache", "User-Agent": "BEVP/1.0"},
         ) as client:
             while not self._stop_event.is_set():
                 started = time.monotonic()
@@ -244,11 +253,12 @@ class VideoCaptureService:
                 elapsed = time.monotonic() - started
                 self._stop_event.wait(max(self.snapshot_interval_seconds - elapsed, 0.0))
 
-    def _queue_frame(self, frame: np.ndarray):
+    def _queue_frame(self, frame: np.ndarray, metadata: Optional[dict] = None):
+        packet = (frame, metadata or {})
         if self.source_type == "file":
             while not self._stop_event.is_set():
                 try:
-                    self._frame_queue.put(frame, timeout=0.1)
+                    self._frame_queue.put(packet, timeout=0.1)
                     self.frames_read += 1
                     return
                 except queue.Full:
@@ -262,7 +272,7 @@ class VideoCaptureService:
                 self.frames_dropped += 1
             except queue.Empty:
                 pass
-        self._frame_queue.put(frame)
+        self._frame_queue.put(packet)
 
     def _connect(self) -> bool:
         try:
@@ -313,7 +323,9 @@ class VideoCaptureService:
         return re.sub(r"([a-z][a-z0-9+.-]*://)[^/@:]+:[^/@]+@", r"\1***:***@", url, flags=re.I)
 
     @staticmethod
-    def _open_capture(url: str, timeout: float) -> cv2.VideoCapture:
+    def _open_capture(url: str | int, timeout: float) -> cv2.VideoCapture:
+        if isinstance(url, int):
+            return cv2.VideoCapture(url, cv2.CAP_ANY)
         params = []
         if hasattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC"):
             params.extend([cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, int(timeout * 1000)])
@@ -322,6 +334,12 @@ class VideoCaptureService:
         if params:
             return cv2.VideoCapture(url, cv2.CAP_FFMPEG, params)
         return cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+
+    @staticmethod
+    def _capture_source(url: str, source_type: str) -> str | int:
+        if source_type == "usb":
+            return int(url.removeprefix("usb://"))
+        return url
 
     @classmethod
     def _decode_snapshot(cls, content: bytes) -> np.ndarray:
@@ -364,7 +382,7 @@ class VideoCaptureService:
         cap = None
         started = time.monotonic()
         try:
-            cap = cls._open_capture(url, timeout)
+            cap = cls._open_capture(cls._capture_source(url, source_type), timeout)
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             if not cap.isOpened():
                 return {
@@ -414,7 +432,7 @@ class VideoCaptureService:
                 url,
                 timeout=timeout,
                 follow_redirects=True,
-                headers={"Cache-Control": "no-cache", "User-Agent": "VTP/2.0"},
+                headers={"Cache-Control": "no-cache", "User-Agent": "BEVP/1.0"},
             )
             response.raise_for_status()
             frame = cls._decode_snapshot(response.content)

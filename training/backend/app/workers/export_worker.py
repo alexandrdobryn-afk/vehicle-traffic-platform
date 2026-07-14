@@ -26,7 +26,7 @@ def export_onnx(self, model_version_id: int):
         if mv.onnx_path and os.path.exists(mv.onnx_path):
             return {"success": True, "onnx_path": mv.onnx_path, "reused": True}
 
-        if model_type in ("vehicle_detector", "plate_detector", "vehicle_segmenter", "plate_segmenter"):
+        if model_type in ("object_detector", "object_segmenter"):
             onnx_path = _export_yolo_onnx(mv.weights_path, onnx_path)
         else:
             return {
@@ -58,7 +58,7 @@ def export_tensorrt(self, model_version_id: int, half: bool = True):
         if not mv:
             return {"success": False, "error": "Model not found"}
 
-        if mv.model_type not in ("vehicle_detector", "plate_detector", "vehicle_segmenter", "plate_segmenter"):
+        if mv.model_type not in ("object_detector", "object_segmenter"):
             return {"success": False, "error": "TensorRT export only supported for YOLO models"}
 
         weights = mv.weights_path

@@ -3,7 +3,7 @@ import { useEffect, useRef, useState } from 'react'
 import AppShell from '@/components/shared/AppShell'
 import trainingApi from '@/lib/trainingApi'
 import { TDataset, TDatasetImage, MODEL_TYPE_LABELS } from '@/types/training'
-import { Upload, Video, Split, BarChart2, Image, Pencil } from 'lucide-react'
+import { Upload, Video, Split, BarChart2, Image, Pencil, LockKeyhole, GitBranch } from 'lucide-react'
 import Link from 'next/link'
 import toast from 'react-hot-toast'
 import { useParams } from 'next/navigation'
@@ -22,7 +22,8 @@ export default function DatasetDetailPage() {
   const [splitting, setSplitting] = useState(false)
   const imgInputRef = useRef<HTMLInputElement>(null)
   const vidInputRef = useRef<HTMLInputElement>(null)
-  const [splitConfig, setSplitConfig] = useState({ train_ratio: 0.7, val_ratio: 0.2, test_ratio: 0.1, seed: 42 })
+  const [splitConfig, setSplitConfig] = useState({ train_ratio: 0.8, val_ratio: 0.2, test_ratio: 0, seed: 42 })
+  const [frameIntervalSeconds, setFrameIntervalSeconds] = useState(5)
 
   const load = async () => {
     const [ds, st, as_, imgs] = await Promise.all([
@@ -61,8 +62,9 @@ export default function DatasetDetailPage() {
       const r = await trainingApi.post(`/datasets/${datasetId}/videos`, fd, {
         headers: { 'Content-Type': 'multipart/form-data' },
       })
-      // Auto extract at 1fps
-      await trainingApi.post(`/datasets/${datasetId}/videos/${r.data.id}/extract`, { fps: 1.0 })
+      await trainingApi.post(`/datasets/${datasetId}/videos/${r.data.id}/extract`, {
+        interval_seconds: frameIntervalSeconds,
+      })
       toast.success(t('Video uploaded — frame extraction queued'))
       load()
     } catch { toast.error(t('Video upload failed')) }
@@ -90,6 +92,20 @@ export default function DatasetDetailPage() {
     } catch { toast.error(t('Export failed')) }
   }
 
+  const handleFreeze = async () => {
+    if (!confirm(t('Freeze this dataset version? Files, annotations and splits will become immutable.'))) return
+    try { await trainingApi.post(`/datasets/${datasetId}/freeze`); toast.success(t('Dataset version frozen')); load() }
+    catch (error: any) { toast.error(error.response?.data?.detail || t('Freeze failed')) }
+  }
+
+  const handleNewVersion = async () => {
+    if (!dataset) return
+    const version = prompt(t('New version label'), dataset.version === '1.0' ? '1.1' : '')
+    if (!version) return
+    try { const response = await trainingApi.post(`/datasets/${datasetId}/versions`, null, { params: { version } }); window.location.href = `/training/datasets/${response.data.id}` }
+    catch (error: any) { toast.error(error.response?.data?.detail || t('Version creation failed')) }
+  }
+
   if (!dataset) return <AppShell><div className="p-6 text-muted-foreground">{t('Loading...')}</div></AppShell>
 
   return (
@@ -103,10 +119,15 @@ export default function DatasetDetailPage() {
               {t(MODEL_TYPE_LABELS[dataset.model_type])} · {t(dataset.annotation_type)} · v{dataset.version}
             </p>
           </div>
-          <Link href={`/training/annotate/${datasetId}`}
-            className="flex items-center gap-2 px-4 py-2 bg-primary text-primary-foreground rounded-lg text-sm font-medium hover:bg-primary/90">
-            <Pencil className="w-4 h-4" /> {t('Open Annotator')}
-          </Link>
+          <div className="flex items-center gap-2">
+            {dataset.is_frozen ? <button onClick={handleNewVersion} className="flex items-center gap-2 px-4 py-2 border border-border rounded-lg text-sm"><GitBranch className="w-4 h-4" />{t('New version')}</button> : <button onClick={handleFreeze} className="flex items-center gap-2 px-4 py-2 border border-amber-500/30 text-amber-400 rounded-lg text-sm"><LockKeyhole className="w-4 h-4" />{t('Freeze version')}</button>}
+            {!dataset.is_frozen && <Link href={`/training/annotate/${datasetId}`} className="flex items-center gap-2 px-4 py-2 bg-primary text-primary-foreground rounded-lg text-sm font-medium hover:bg-primary/90"><Pencil className="w-4 h-4" /> {t('Open Annotator')}</Link>}
+          </div>
+        </div>
+
+        <div className={`rounded-xl border p-4 ${dataset.is_frozen ? 'border-emerald-500/25 bg-emerald-500/5' : 'border-amber-500/25 bg-amber-500/5'}`}>
+          <div className="flex items-center gap-2"><LockKeyhole className={`w-4 h-4 ${dataset.is_frozen ? 'text-emerald-400' : 'text-amber-400'}`} /><p className="text-sm font-medium">{dataset.is_frozen ? t('Immutable dataset version') : t('Mutable working dataset')}</p></div>
+          <p className="text-xs text-muted-foreground mt-1 font-mono break-all">{dataset.content_hash ? `sha256:${dataset.content_hash}` : t('Freeze before training to create a reproducible content fingerprint.')}</p>
         </div>
 
         {/* Stats cards */}
@@ -125,6 +146,20 @@ export default function DatasetDetailPage() {
           ))}
         </div>
 
+        {stats?.frame_status_counts && (
+          <div className="bg-card border border-border rounded-xl p-5">
+            <h3 className="text-sm font-semibold text-foreground mb-4">{t('Frame Status')}</h3>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+              {Object.entries(stats.frame_status_counts as Record<string, number>).map(([status, count]) => (
+                <div key={status} className="rounded-lg bg-muted/50 p-3">
+                  <p className="text-xs text-muted-foreground">{t(status)}</p>
+                  <p className="text-lg font-bold text-foreground">{count}</p>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
         {/* Upload section */}
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           <div className="bg-card border border-dashed border-border rounded-xl p-6 text-center">
@@ -133,7 +168,7 @@ export default function DatasetDetailPage() {
             <p className="text-xs text-muted-foreground mb-4">JPG, PNG, BMP, WEBP</p>
             <input ref={imgInputRef} type="file" multiple accept="image/*" className="hidden"
               onChange={handleImageUpload} />
-            <button onClick={() => imgInputRef.current?.click()} disabled={uploading}
+            <button onClick={() => imgInputRef.current?.click()} disabled={uploading || dataset.is_frozen}
               className="px-4 py-2 bg-primary text-primary-foreground rounded-lg text-sm font-medium hover:bg-primary/90 disabled:opacity-50">
               {uploading ? t('Uploading...') : t('Choose Images')}
             </button>
@@ -142,10 +177,21 @@ export default function DatasetDetailPage() {
           <div className="bg-card border border-dashed border-border rounded-xl p-6 text-center">
             <Video className="w-8 h-8 text-muted-foreground mx-auto mb-3" />
             <p className="text-sm font-medium text-foreground mb-1">{t('Upload Video')}</p>
-            <p className="text-xs text-muted-foreground mb-4">{t('MP4, AVI, MOV — auto-extracts frames')}</p>
+            <p className="text-xs text-muted-foreground mb-4">{t('MP4, AVI, MOV — extracts training frames by interval')}</p>
+            <label className="mx-auto mb-4 block max-w-[260px] text-left text-xs text-muted-foreground">
+              {t('Select one frame every N seconds')}
+              <input
+                type="number"
+                min={1}
+                max={3600}
+                value={frameIntervalSeconds}
+                onChange={e => setFrameIntervalSeconds(Number(e.target.value))}
+                className="mt-1 w-full rounded-lg border border-input bg-background px-3 py-2 text-sm text-foreground"
+              />
+            </label>
             <input ref={vidInputRef} type="file" accept="video/*" className="hidden"
               onChange={handleVideoUpload} />
-            <button onClick={() => vidInputRef.current?.click()} disabled={uploading}
+            <button onClick={() => vidInputRef.current?.click()} disabled={uploading || dataset.is_frozen}
               className="px-4 py-2 bg-muted text-muted-foreground rounded-lg text-sm hover:text-foreground disabled:opacity-50">
               {uploading ? t('Uploading...') : t('Choose Video')}
             </button>
@@ -156,13 +202,13 @@ export default function DatasetDetailPage() {
         <div className="bg-card border border-border rounded-xl p-5 space-y-4">
           <div className="flex items-center gap-2">
             <Split className="w-4 h-4 text-muted-foreground" />
-            <h3 className="text-sm font-semibold text-foreground">{t('Train / Val / Test Split')}</h3>
+            <h3 className="text-sm font-semibold text-foreground">{t('Train / Validation Split')}</h3>
           </div>
           <div className="grid grid-cols-3 gap-4">
             {[
               { label: 'Train', key: 'train_ratio', color: 'bg-blue-400' },
               { label: 'Validation', key: 'val_ratio', color: 'bg-amber-400' },
-              { label: 'Test', key: 'test_ratio', color: 'bg-emerald-400' },
+              { label: 'Manual test holdout', key: 'test_ratio', color: 'bg-emerald-400' },
             ].map(({ label, key, color }) => (
               <div key={key}>
                 <label className="block text-xs text-muted-foreground mb-1">{t(label)}</label>
@@ -187,7 +233,7 @@ export default function DatasetDetailPage() {
                 onChange={e => setSplitConfig(s => ({ ...s, seed: parseInt(e.target.value) }))}
                 className="w-20 px-2 py-1 bg-background border border-input rounded text-xs text-foreground focus:outline-none" />
             </div>
-            <button onClick={handleSplit} disabled={splitting}
+            <button onClick={handleSplit} disabled={splitting || dataset.is_frozen}
               className="px-4 py-2 bg-primary text-primary-foreground rounded-lg text-sm font-medium hover:bg-primary/90 disabled:opacity-50">
               {splitting ? t('Splitting...') : t('Apply Split')}
             </button>
@@ -232,6 +278,11 @@ export default function DatasetDetailPage() {
                   />
                   {img.is_annotated && (
                     <span className="absolute top-0.5 right-0.5 w-2 h-2 bg-emerald-400 rounded-full border border-card" />
+                  )}
+                  {img.review_reason && (
+                    <span className="absolute top-0.5 left-0.5 max-w-[80%] truncate rounded bg-black/70 px-1 text-[8px] text-white">
+                      {t(img.frame_status)}
+                    </span>
                   )}
                   {img.split && (
                     <span className={`absolute bottom-0.5 left-0.5 text-[8px] px-1 rounded font-bold ${

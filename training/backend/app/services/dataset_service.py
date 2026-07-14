@@ -3,9 +3,10 @@ import shutil
 import json
 import random
 import asyncio
+import hashlib
 from typing import Dict, List, Optional, Tuple
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 import logging
 import cv2
 import numpy as np
@@ -13,7 +14,7 @@ import numpy as np
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update, func
 
-from app.models.database import Dataset, DatasetImage, DatasetVideo, DatasetSplit
+from app.models.database import Annotation, Dataset, DatasetImage, DatasetVideo, DatasetSplit
 from app.schemas.schemas import DatasetCreate, DatasetSplitConfig, VideoExtractConfig
 from app.config import settings
 
@@ -63,6 +64,179 @@ class DatasetService:
         result = await db.execute(select(Dataset).where(Dataset.id == dataset_id))
         return result.scalar_one_or_none()
 
+    @staticmethod
+    def require_mutable(dataset: Dataset) -> None:
+        if dataset.is_frozen:
+            raise ValueError(
+                "Dataset version is frozen. Create a new version before changing files, annotations or splits."
+            )
+
+    async def freeze_dataset(self, db: AsyncSession, dataset_id: int) -> Dataset:
+        dataset = await self.get_dataset(db, dataset_id)
+        if not dataset:
+            raise ValueError("Dataset not found")
+        if dataset.is_frozen and dataset.content_hash:
+            return dataset
+
+        active_video_jobs = await db.scalar(select(func.count(DatasetVideo.id)).where(
+            DatasetVideo.dataset_id == dataset_id,
+            DatasetVideo.status.in_(["queued", "extracting"]),
+        ))
+        if active_video_jobs:
+            raise ValueError("Wait for queued video extraction jobs before freezing this dataset")
+
+        digest = hashlib.sha256()
+        digest.update(json.dumps({
+            "model_type": str(dataset.model_type),
+            "annotation_type": str(dataset.annotation_type),
+            "classes": dataset.classes or [],
+        }, sort_keys=True, separators=(",", ":")).encode())
+        result = await db.execute(
+            select(DatasetImage).where(DatasetImage.dataset_id == dataset_id).order_by(DatasetImage.id)
+        )
+        images = result.scalars().all()
+        videos = (await db.execute(
+            select(DatasetVideo).where(DatasetVideo.dataset_id == dataset_id).order_by(DatasetVideo.id)
+        )).scalars().all()
+        for video in videos:
+            digest.update(f"video:{video.filename}".encode())
+            path = Path(video.file_path)
+            if path.is_file():
+                with path.open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        digest.update(chunk)
+        for image in images:
+            path = Path(image.file_path)
+            digest.update(f"{image.filename}:{image.split or ''}".encode())
+            if path.is_file():
+                with path.open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        digest.update(chunk)
+            annotations = (await db.execute(
+                select(Annotation).where(Annotation.image_id == image.id).order_by(Annotation.id)
+            )).scalars().all()
+            for annotation in annotations:
+                digest.update(json.dumps({
+                    "type": annotation.annotation_type, "class": annotation.class_name,
+                    "class_id": annotation.class_id, "bbox": [annotation.x_center, annotation.y_center, annotation.bbox_width, annotation.bbox_height],
+                    "polygon": annotation.polygon, "ocr": annotation.ocr_text, "label": annotation.label,
+                }, sort_keys=True, separators=(",", ":")).encode())
+                if annotation.mask_path and Path(annotation.mask_path).is_file():
+                    with Path(annotation.mask_path).open("rb") as handle:
+                        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                            digest.update(chunk)
+
+        dataset.content_hash = digest.hexdigest()
+        dataset.is_frozen = True
+        dataset.frozen_at = datetime.now(timezone.utc)
+        dataset.status = "frozen"
+        dataset.lineage = {
+            **(dataset.lineage or {}),
+            "frozen_image_count": len(images),
+            "frozen_video_count": len(videos),
+            "hash_algorithm": "sha256",
+        }
+        await db.commit()
+        await db.refresh(dataset)
+        return dataset
+
+    async def create_version(
+        self,
+        db: AsyncSession,
+        dataset_id: int,
+        version: str,
+        author_email: str,
+    ) -> Dataset:
+        source = await self.get_dataset(db, dataset_id)
+        if not source:
+            raise ValueError("Dataset not found")
+        if not source.is_frozen or not source.content_hash:
+            raise ValueError("Freeze the source dataset before creating its next version")
+
+        target = Dataset(
+            name=source.name, description=source.description,
+            model_type=source.model_type, annotation_type=source.annotation_type,
+            classes=source.classes or [], tags=source.tags or [], status="draft",
+            version=version, parent_dataset_id=source.id, author_email=author_email,
+            lineage={"parent_dataset_id": source.id, "parent_content_hash": source.content_hash},
+        )
+        db.add(target)
+        await db.flush()
+        target_root = self.datasets_root / str(target.id)
+        for directory in ("images", "labels", "videos", "masks"):
+            (target_root / directory).mkdir(parents=True, exist_ok=True)
+        target.storage_path = str(target_root)
+
+        video_map: dict[int, DatasetVideo] = {}
+        source_videos = (await db.execute(
+            select(DatasetVideo).where(DatasetVideo.dataset_id == source.id).order_by(DatasetVideo.id)
+        )).scalars().all()
+        for video in source_videos:
+            destination = target_root / "videos" / video.filename
+            if Path(video.file_path).is_file():
+                shutil.copy2(video.file_path, destination)
+            clone_video = DatasetVideo(
+                dataset_id=target.id, filename=video.filename, file_path=str(destination),
+                file_size=video.file_size, fps=video.fps, total_frames=video.total_frames,
+                duration_seconds=video.duration_seconds, extracted_frames=video.extracted_frames,
+                status=video.status,
+            )
+            db.add(clone_video)
+            await db.flush()
+            video_map[video.id] = clone_video
+
+        image_map: dict[int, DatasetImage] = {}
+        source_images = (await db.execute(
+            select(DatasetImage).where(DatasetImage.dataset_id == source.id).order_by(DatasetImage.id)
+        )).scalars().all()
+        for image in source_images:
+            destination = target_root / "images" / image.filename
+            if Path(image.file_path).is_file():
+                shutil.copy2(image.file_path, destination)
+            clone = DatasetImage(
+                dataset_id=target.id, filename=image.filename,
+                original_filename=image.original_filename, file_path=str(destination),
+                file_size=image.file_size, width=image.width, height=image.height,
+                source=image.source, source_frame_idx=image.source_frame_idx,
+                source_video_id=(video_map[image.source_video_id].id if image.source_video_id in video_map else None),
+                split=image.split, is_annotated=image.is_annotated,
+            )
+            db.add(clone)
+            await db.flush()
+            image_map[image.id] = clone
+
+        annotations = (await db.execute(
+            select(Annotation).join(DatasetImage).where(DatasetImage.dataset_id == source.id)
+        )).scalars().all()
+        for annotation in annotations:
+            cloned_mask_path = None
+            if annotation.mask_path and Path(annotation.mask_path).is_file():
+                mask_name = f"annotation_{annotation.id}_{Path(annotation.mask_path).name}"
+                mask_destination = target_root / "masks" / mask_name
+                shutil.copy2(annotation.mask_path, mask_destination)
+                cloned_mask_path = str(mask_destination)
+            db.add(Annotation(
+                image_id=image_map[annotation.image_id].id,
+                annotation_type=annotation.annotation_type, class_name=annotation.class_name,
+                class_id=annotation.class_id, x_center=annotation.x_center, y_center=annotation.y_center,
+                bbox_width=annotation.bbox_width, bbox_height=annotation.bbox_height,
+                polygon=annotation.polygon, mask_path=cloned_mask_path, provenance=annotation.provenance,
+                ocr_text=annotation.ocr_text, label=annotation.label, confidence=annotation.confidence,
+                is_auto=annotation.is_auto, is_verified=annotation.is_verified,
+            ))
+        splits = (await db.execute(select(DatasetSplit).where(DatasetSplit.dataset_id == source.id))).scalars().all()
+        for split in splits:
+            db.add(DatasetSplit(
+                dataset_id=target.id, split_name=split.split_name,
+                image_count=split.image_count, ratio=split.ratio, seed=split.seed,
+            ))
+        target.image_count = len(source_images)
+        target.annotation_count = len(annotations)
+        target.video_count = len(source_videos)
+        await db.commit()
+        await db.refresh(target)
+        return target
+
     async def list_datasets(
         self, db: AsyncSession, model_type: Optional[str] = None
     ) -> List[Dataset]:
@@ -94,6 +268,7 @@ class DatasetService:
         ds = await self.get_dataset(db, dataset_id)
         if not ds:
             raise ValueError(f"Dataset {dataset_id} not found")
+        self.require_mutable(ds)
 
         images_dir = Path(ds.storage_path) / "images"
         images_dir.mkdir(exist_ok=True)
@@ -147,6 +322,7 @@ class DatasetService:
         ds = await self.get_dataset(db, dataset_id)
         if not ds:
             raise ValueError(f"Dataset {dataset_id} not found")
+        self.require_mutable(ds)
 
         videos_dir = Path(ds.storage_path) / "videos"
         videos_dir.mkdir(exist_ok=True)
@@ -195,6 +371,9 @@ class DatasetService:
         video = result.scalar_one_or_none()
         if not ds or not video:
             return 0
+        self.require_mutable(ds)
+        if video.dataset_id != dataset_id:
+            raise ValueError("Video does not belong to this dataset")
 
         images_dir = Path(ds.storage_path) / "images"
         images_dir.mkdir(exist_ok=True)
@@ -228,6 +407,7 @@ class DatasetService:
                 height=h,
                 source="video_frame",
                 source_video_id=video_id,
+                frame_status="unlabeled",
             )
             db.add(img)
 
@@ -256,7 +436,10 @@ class DatasetService:
         native_fps = cap.get(cv2.CAP_PROP_FPS)
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-        frame_interval = max(1, int(native_fps / config.fps))
+        if config.interval_seconds is not None:
+            frame_interval = max(1, int(native_fps * config.interval_seconds))
+        else:
+            frame_interval = max(1, int(native_fps / config.fps))
         start_frame = int(config.start_time * native_fps)
         end_frame = int(config.end_time * native_fps) if config.end_time else total
 
@@ -291,6 +474,10 @@ class DatasetService:
         config: DatasetSplitConfig,
     ) -> Dict:
         """Split dataset images into train/val/test."""
+        dataset = await self.get_dataset(db, dataset_id)
+        if not dataset:
+            raise ValueError("Dataset not found")
+        self.require_mutable(dataset)
         result = await db.execute(
             select(DatasetImage).where(DatasetImage.dataset_id == dataset_id)
         )
@@ -333,6 +520,9 @@ class DatasetService:
         # Bulk update
         for img in images:
             img.split = splits[img.id]
+            if img.is_annotated and img.frame_status in ("reviewed", "approved", "training_ready"):
+                img.frame_status = "training_ready"
+        dataset.status = "ready_for_training" if any(img.is_annotated for img in images) else dataset.status
         await db.commit()
 
         # Update/create split records
@@ -446,6 +636,16 @@ class DatasetService:
             "video_count": ds.video_count,
             "annotation_count": ann_count or 0,
             "classes": ds.classes,
+            "frame_status_counts": {
+                row[0] or "unlabeled": row[1]
+                for row in (
+                    await db.execute(
+                        select(DatasetImage.frame_status, func.count(DatasetImage.id))
+                        .where(DatasetImage.dataset_id == dataset_id)
+                        .group_by(DatasetImage.frame_status)
+                    )
+                ).all()
+            },
         }
 
 

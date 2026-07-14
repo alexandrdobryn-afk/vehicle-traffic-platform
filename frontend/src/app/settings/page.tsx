@@ -4,7 +4,7 @@ import { useEffect, useState } from 'react'
 import { AlertTriangle, CheckCircle2, Cpu, Gauge, KeyRound, Loader2, Save, Sparkles } from 'lucide-react'
 
 import AppShell from '@/components/shared/AppShell'
-import api from '@/lib/api'
+import api, { apiErrorMessage } from '@/lib/api'
 import { useTranslation } from '@/lib/i18n'
 import type { AppSettings, GeminiSettings, RuntimeStatus } from '@/types'
 
@@ -18,16 +18,24 @@ export default function SettingsPage() {
   const [geminiKey, setGeminiKey] = useState('')
   const [geminiBusy, setGeminiBusy] = useState(false)
   const [geminiMessage, setGeminiMessage] = useState('')
+  const [loadError, setLoadError] = useState('')
 
   const load = async () => {
-    const [settingsResponse, runtimeResponse, geminiResponse] = await Promise.all([
+    setLoadError('')
+    setMessage('')
+    const [settingsResponse, runtimeResponse] = await Promise.all([
       api.get('/settings'),
       api.get('/settings/runtime-status'),
-      api.get('/settings/gemini'),
     ])
     setSettings(settingsResponse.data)
     setRuntime(runtimeResponse.data)
-    setGemini(geminiResponse.data)
+    try {
+      const geminiResponse = await api.get('/settings/gemini')
+      setGemini(geminiResponse.data)
+    } catch (error: any) {
+      setGemini(null)
+      setGeminiMessage(apiErrorMessage(error, t('Connection failed')))
+    }
   }
 
   const saveGemini = async () => {
@@ -46,7 +54,7 @@ export default function SettingsPage() {
       setGeminiKey('')
       setGeminiMessage(t('Gemini settings saved'))
     } catch (error: any) {
-      setGeminiMessage(error.response?.data?.detail || t('Failed to save'))
+      setGeminiMessage(apiErrorMessage(error, t('Failed to save')))
     } finally {
       setGeminiBusy(false)
     }
@@ -56,16 +64,20 @@ export default function SettingsPage() {
     setGeminiBusy(true)
     setGeminiMessage('')
     try {
-      const response = await api.post('/settings/gemini/test')
+      const response = await api.post('/settings/gemini/test', {}, {
+        timeout: Math.max(30000, ((gemini?.request_timeout_seconds || 30) + 5) * 1000),
+      })
       setGeminiMessage(`${t('Connection successful')}: ${response.data.model}`)
     } catch (error: any) {
-      setGeminiMessage(error.response?.data?.detail || t('Connection failed'))
+      setGeminiMessage(apiErrorMessage(error, t('Connection failed')))
     } finally {
       setGeminiBusy(false)
     }
   }
 
-  useEffect(() => { load().catch(() => setMessage(t('Failed to load settings'))) }, [])
+  useEffect(() => {
+    load().catch((error) => setLoadError(apiErrorMessage(error, t('Failed to load settings'))))
+  }, [])
 
   const save = async () => {
     if (!settings) return
@@ -76,7 +88,7 @@ export default function SettingsPage() {
       setRuntime(response.data.runtime)
       setMessage(t('Settings saved'))
     } catch (error: any) {
-      setMessage(error.response?.data?.detail || t('Failed to save'))
+      setMessage(apiErrorMessage(error, t('Failed to save')))
     } finally {
       setSaving(false)
     }
@@ -91,7 +103,22 @@ export default function SettingsPage() {
         </div>
 
         {!settings || !runtime ? (
-          <div className="flex items-center gap-2 text-muted-foreground"><Loader2 className="w-4 h-4 animate-spin" />{t('Loading...')}</div>
+          loadError ? (
+            <div className="rounded-xl border border-red-500/20 bg-red-500/10 p-4 text-sm text-red-200 space-y-3">
+              <div className="flex items-start gap-2">
+                <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
+                <div>
+                  <div className="font-medium">{t('Failed to load settings')}</div>
+                  <div className="mt-1 text-red-100/80">{loadError}</div>
+                </div>
+              </div>
+              <button onClick={load} className="rounded-lg border border-red-400/30 px-3 py-2 text-xs font-medium text-red-100 hover:bg-red-500/10">
+                {t('Refresh')}
+              </button>
+            </div>
+          ) : (
+            <div className="flex items-center gap-2 text-muted-foreground"><Loader2 className="w-4 h-4 animate-spin" />{t('Loading...')}</div>
+          )
         ) : (
           <>
             <section className="bg-card border border-border rounded-xl p-6 space-y-5">
@@ -99,7 +126,7 @@ export default function SettingsPage() {
                 <Cpu className="w-5 h-5 text-primary mt-0.5" />
                 <div>
                   <h2 className="font-semibold text-foreground">{t('Compute runtime')}</h2>
-                  <p className="text-sm text-muted-foreground mt-1">{t('This global policy decides where every camera and video runs. Recognition models remain source-local.')}</p>
+                  <p className="text-sm text-muted-foreground mt-1">{t('This global policy decides where every camera and aerial video runs. Detection settings remain source-local.')}</p>
                 </div>
               </div>
 
@@ -110,16 +137,25 @@ export default function SettingsPage() {
                   ['cuda', 'NVIDIA CUDA', 'Requires NVIDIA GPU and CUDA runtime'],
                 ] as const).map(([value, label, description]) => {
                   const disabled = value === 'cuda' && !runtime.capabilities.cuda.available
+                  const disabledReason = runtime.capabilities.container_runtime === 'cpu'
+                    ? 'CUDA is unavailable because the current containers are running in CPU mode.'
+                    : 'CUDA is unavailable in this WSL/Docker environment.'
                   return (
                     <button
                       key={value}
                       type="button"
                       disabled={disabled}
+                      title={disabled ? t(disabledReason) : undefined}
                       onClick={() => setSettings({ ...settings, execution_provider: value })}
                       className={`text-left rounded-lg border p-4 transition ${settings.execution_provider === value ? 'border-primary bg-primary/10' : 'border-border bg-background'} ${disabled ? 'opacity-45 cursor-not-allowed' : 'hover:border-primary/60'}`}
                     >
                       <div className="font-medium text-foreground">{t(label)}</div>
                       <div className="text-xs text-muted-foreground mt-1">{t(description)}</div>
+                      {disabled && (
+                        <div className="mt-3 rounded-md border border-amber-500/20 bg-amber-500/10 px-2 py-1 text-[11px] text-amber-200">
+                          {t(disabledReason)}
+                        </div>
+                      )}
                     </button>
                   )
                 })}
@@ -215,7 +251,7 @@ export default function SettingsPage() {
             )}
 
             <div className="bg-card border border-border rounded-xl p-4 text-sm text-muted-foreground">
-              {t('Detector thresholds, OCR, voting, resolution, FPS, storage and privacy remain configured separately for each camera or video.')}
+              {t('Detection thresholds, aerial tiling, target classes, tracking and optional modules are configured separately for each camera or video.')}
             </div>
 
             <div className="flex items-center gap-3">
